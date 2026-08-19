@@ -72,16 +72,52 @@ export default async function AuditPage() {
   );
 }
 
-/** Metadata is free-form jsonb; show the fields a human actually scans for. */
+/**
+ * Metadata is free-form jsonb; show the fields a human actually scans for.
+ *
+ * A whitelist rather than a dump. Some of these payloads carry the whole
+ * evidence tree behind a proposal, and a log line that wraps over six rows is
+ * one nobody reads — which defeats the point of having a log.
+ */
+const INTERESTING_KEYS = [
+  // Week 1: organizations, workspaces, uploads.
+  'name',
+  'original_filename',
+  'client_name',
+  'slug',
+  'byte_size',
+  'reason',
+  // The agent.
+  'kind',
+  'version_no',
+  'row_count',
+  'count',
+  'attempt',
+  'worker',
+  'group_keys',
+  'model',
+  'question',
+  'error',
+];
+
 function summarise(metadata: unknown): string {
   if (!metadata || typeof metadata !== 'object') return '—';
 
   const record = metadata as Record<string, unknown>;
-  const interesting = ['name', 'original_filename', 'client_name', 'slug', 'byte_size', 'reason'];
 
-  const parts = interesting
-    .filter((key) => record[key] !== undefined && record[key] !== null)
-    .map((key) => `${key}=${String(record[key])}`);
+  const parts = INTERESTING_KEYS.filter(
+    (key) => record[key] !== undefined && record[key] !== null,
+  ).map((key) => {
+    const value = record[key];
+    // An approval can cover a dozen groups. The count is what is scannable;
+    // the group names are in the proposals themselves.
+    if (Array.isArray(value)) {
+      return value.length <= 3
+        ? `${key}=${value.join(',')}`
+        : `${key}=${value.length} groups`;
+    }
+    return `${key}=${String(value)}`;
+  });
 
   return parts.length > 0 ? parts.join('  ') : '—';
 }

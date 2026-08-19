@@ -1,0 +1,70 @@
+# systemd unit, for running Hermes on the VPS without Docker.
+#
+# Docker Compose is the recommended path (see the README). This exists because
+# a 1 GB Hostinger plan running Docker spends a meaningful slice of its memory
+# on the daemon, and because some people would simply rather not.
+#
+# Install:
+#   sudo cp deploy/hermes.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hermes
+#
+# Watch:  journalctl -u hermes -f
+# Reload: sudo systemctl restart hermes    (after editing /etc/hermes/hermes.env)
+
+[Unit]
+Description=Hermes data-operations agent
+Documentation=https://github.com/yahyeameer/AI-Data-Operations-Platform
+# Wants= rather than Requires=: Supabase being unreachable at boot is a
+# condition the worker already handles by backing off and retrying, so it must
+# not be a reason to refuse to start.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes
+
+# Secrets live in a root-owned file readable only by the service user, not in
+# the unit -- systemd units are world-readable and land in `systemctl cat`.
+EnvironmentFile=/etc/hermes/hermes.env
+
+ExecStart=/opt/hermes/.venv/bin/python -m hermes
+
+Restart=always
+RestartSec=10
+# Give a long parse time to finish on SIGTERM. The worker stops claiming
+# immediately and exits once the current job is done, so a deploy does not cost
+# the customer a run.
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes
+
+# Hardening. The agent holds the service-role key; if it is ever exploited,
+# this is what limits the blast radius to the process itself.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# The only writable path it needs.
+ReadWritePaths=/var/lib/hermes
+# Outbound HTTPS only. No listening socket, ever.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Matches the compose limit, and for the same reason.
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

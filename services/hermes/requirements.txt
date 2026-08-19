@@ -1,0 +1,9 @@
+# Pinned to majors rather than exact versions: this runs on a VPS that gets
+# rebuilt occasionally, and a lockfile that stops resolving is a worse outage
+# than a patch-level drift.
+httpx>=0.27,<0.29
+openpyxl>=3.1,<4
+polars>=1.0,<2
+duckdb>=1.1,<2
+pyarrow>=17,<22
+python-dotenv>=1.0,<2

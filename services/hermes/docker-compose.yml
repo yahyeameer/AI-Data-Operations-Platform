@@ -1,0 +1,49 @@
+# Hermes on a Hostinger VPS.
+#
+#   docker compose up -d --build     start, and start again on every reboot
+#   docker compose logs -f           watch it work
+#   docker compose restart           pick up a changed .env
+#   docker compose down              stop
+#
+# One service. The database is hosted Supabase, so there is nothing else to run
+# here and nothing to back up on this box -- the VPS holds no state, which is
+# what makes "rebuild it from scratch" a five-minute operation rather than a
+# recovery plan.
+
+services:
+  hermes:
+    build: .
+    # `unless-stopped` rather than `always`: it survives reboots and crashes,
+    # but a deliberate `docker compose stop` stays stopped instead of coming
+    # back the next time the machine boots.
+    restart: unless-stopped
+    env_file: .env
+
+    volumes:
+      # Scratch space for parsing. Named rather than bind-mounted so it is not
+      # affected by the host's permissions, and so `docker compose down -v`
+      # cleans it up.
+      - hermes-work:/var/lib/hermes
+
+    # A single 1 GB VPS is the target. The parser holds a workbook in memory
+    # while it reads it, so the cap is set above the 50 MB upload limit with
+    # room for Arrow's buffers -- and set at all so that one pathological file
+    # cannot take the whole box down with it.
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+    logging:
+      driver: json-file
+      options:
+        # Without this the log grows until the disk is full, which on a small
+        # VPS happens quietly and then all at once.
+        max-size: "10m"
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  hermes-work:

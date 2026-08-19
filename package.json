@@ -11,7 +11,9 @@
     "db:seed": "tsx scripts/seed-demo.ts",
     "db:types": "supabase gen types typescript --local > apps/web/src/lib/database.types.ts",
     "test:isolation": "tsx scripts/rls-smoke.ts",
+    "test:agent": "tsx scripts/agent-smoke.ts",
     "test:e2e": "tsx scripts/e2e-upload.ts",
+    "test:agent:e2e": "tsx scripts/agent-e2e.ts",
     "fixtures": "python scripts/make_messy_fixture.py"
   },
   "devDependencies": {

@@ -14,7 +14,7 @@ supabase/.branches
 supabase/.temp
 supabase/.env
 
-# Python (services/parser, from Week 2)
+# Python (services/hermes)
 __pycache__/
 *.py[cod]
 .venv/

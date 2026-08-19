@@ -133,7 +133,7 @@ export function UploadPanel({
     <form onSubmit={onSubmit} method="post" className="space-y-4">
       <Field
         label="Recurring dataset"
-        hint="Group each month's file under the same dataset. From Week 2 the parser matches this automatically."
+        hint="Group each month's file under the same dataset. The agent fingerprints the layout on the first parse, so next month's file can be matched to it."
       >
         <select
           className={inputClass}
