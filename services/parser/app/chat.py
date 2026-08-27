@@ -404,6 +404,275 @@ def pl_all_horizontal_null(df):
     return df.select(expr.alias("_allnull"))["_allnull"]
 
 
+# ---------------------------------------------------------------------------
+# Reliable "categorise this and give me the file" short-circuit.
+#
+# The general agent (a weak free model driving an 8-round tool loop) is
+# unreliable at completing the categorise -> export chain: it tends to gather
+# the data and then narrate a rule plan in prose instead of calling the tools,
+# so no file comes back and the turn can blow past the serverless time cap.
+#
+# When the user's turn clearly means "categorise my statement and hand me the
+# workbook", we bypass the tool loop entirely and run the job in code:
+#   1. resolve the target dataset + its description column (deterministic),
+#   2. generate keyword rules in ONE bounded LLM call, with a built-in UK
+#      keyword library as a guaranteed fallback (so it works even if the model
+#      is down or returns junk),
+#   3. execute the already-verified _apply_categorize + _tool_export engine.
+# This always produces a downloadable, categorised file, fast, and spends at
+# most one model call instead of a multi-round loop.
+# ---------------------------------------------------------------------------
+
+# Column-name hints for the free-text description column on a statement.
+_DESC_COL_HINTS = [
+    "transaction", "description", "narrative", "details", "memo",
+    "reference", "payee", "particulars", "vendor", "merchant", "name",
+]
+
+# Deterministic fallback: sensible UK bank-statement categories. Used when the
+# model call is unavailable or unusable, so a file is ALWAYS produced.
+_DEFAULT_UK_RULES = [
+    {"category": "Payroll", "keywords": ["salary", "wages", "payroll"]},
+    {"category": "Government/HMRC", "keywords": ["hmrc", "dwp", "child benefit",
+        "universal credit", "tax credit", "gov.uk", "council tax", "dvla"]},
+    {"category": "Housing/Rent", "keywords": ["rent", "housing", "mortgage",
+        "landlord", "sovereign", "council"]},
+    {"category": "Utilities", "keywords": ["edf", "british gas", "octopus",
+        "thames water", "water", "vodafone", "virgin", "o2", "sse", "eon",
+        "npower", "gas", "electric", "bt "]},
+    {"category": "Groceries", "keywords": ["tesco", "asda", "sainsbury", "aldi",
+        "lidl", "morrison", "waitrose", "co-op", "coop", "iceland", "m&s"]},
+    {"category": "Transport/Fuel", "keywords": ["shell", "bp ", "esso", "tfl",
+        "uber", "trainline", "petrol", "fuel"]},
+    {"category": "Insurance", "keywords": ["insurance", "aviva", "axa",
+        "direct line", "admiral"]},
+    {"category": "Subscriptions", "keywords": ["netflix", "spotify", "amazon",
+        "prime", "apple", "google", "microsoft"]},
+    {"category": "Transfers", "keywords": ["transfer", "faster payment",
+        "bank giro", "standing order", "direct debit"]},
+    {"category": "Cash/ATM", "keywords": ["atm", "cash", "withdrawal"]},
+    {"category": "Fees", "keywords": ["fee", "charge", "interest", "overdraft"]},
+]
+
+
+def _wants_categorized_file(message: str) -> bool:
+    """True when the turn means 'apply categories to my data / give me the
+    categorised file', rather than merely asking a question about categories."""
+    m = (message or "").lower()
+    if not any(t in m for t in ("categor", "classif")):
+        return False
+    wants_apply = any(t in m for t in (
+        "file", "download", "xlsx", "csv", "spreadsheet", "column", "add ",
+        "tag", "label", "export", "give me", "provide", "sort ", "group ",
+    ))
+    starts = m.lstrip().startswith(("categor", "classif"))
+    return wants_apply or starts
+
+
+def _pick_categorize_dataset(parsed: list[dict[str, Any]], message: str) -> dict[str, Any] | None:
+    """Choose which loaded dataset to categorise. Prefer one the user named by
+    filename, else one that has a description-like column, tie-broken by size."""
+    msg = (message or "").lower()
+    for d in parsed:
+        stem = str(d.get("filename") or "").rsplit(".", 1)[0].strip().lower()
+        if stem and len(stem) >= 4 and stem in msg:
+            return d
+
+    def has_desc(d: dict[str, Any]) -> bool:
+        cols = " ".join(str(c).lower() for c in (d.get("columns") or []))
+        return any(h in cols for h in _DESC_COL_HINTS)
+
+    scored = sorted(parsed, key=lambda d: (has_desc(d), d.get("rows") or 0), reverse=True)
+    return scored[0] if scored else None
+
+
+def _pick_source_column(df, message: str) -> str | None:
+    """Pick the free-text column to read. A name matching a known hint wins;
+    otherwise the column with the widest average text is the description."""
+    import polars as pl
+    if not df.columns:
+        return None
+    for hint in _DESC_COL_HINTS:
+        for c in df.columns:
+            if hint in str(c).lower():
+                return c
+    best, best_len = None, -1.0
+    for c in df.columns:
+        try:
+            avg = df[c].cast(pl.Utf8).str.len_chars().mean() or 0.0
+        except Exception:
+            avg = 0.0
+        if avg > best_len:
+            best, best_len = c, float(avg)
+    return best
+
+
+def _parse_rules_json(content: str):
+    """Defensively parse the model's rule JSON (tolerates code fences / prose).
+    Returns (rules, default) or None."""
+    txt = (content or "").strip()
+    if txt.startswith("```"):
+        txt = txt.strip("`")
+        nl = txt.find("\n")
+        if nl != -1 and txt[:nl].strip().lower() in ("json", ""):
+            txt = txt[nl + 1:]
+    i, j = txt.find("{"), txt.rfind("}")
+    if i == -1 or j == -1 or j <= i:
+        return None
+    try:
+        obj = json.loads(txt[i:j + 1])
+    except Exception:
+        return None
+    rules = obj.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return None
+    clean: list[dict[str, Any]] = []
+    for r in rules:
+        cat = (r or {}).get("category")
+        terms = [str(k).lower() for k in ((r or {}).get("keywords") or []) if str(k).strip()]
+        if cat and terms:
+            clean.append({"category": str(cat), "keywords": terms})
+    if not clean:
+        return None
+    return clean, str(obj.get("default") or "?")
+
+
+async def _generate_rules(descriptions: list[str], message: str):
+    """One bounded model call to produce keyword rules fitted to the actual
+    descriptions. Falls back to the built-in UK library on any problem, so a
+    result is guaranteed. Returns (rules, default, source)."""
+    fallback = (_DEFAULT_UK_RULES, "?", "default-library")
+    if not OPENROUTER_API_KEY or not descriptions:
+        return fallback
+    sample = "\n".join("- " + d[:80] for d in descriptions[:60])
+    sys = ("You build keyword rules to categorise UK bank-statement transactions. "
+           "Output ONLY a JSON object, no prose and no markdown fences.")
+    usr = (
+        f"Distinct transaction descriptions:\n{sample}\n\n"
+        f"User request: {message}\n\n"
+        'Return JSON exactly like {"rules":[{"category":"Name","keywords":["lower","substrings"]}],'
+        '"default":"?"}. Keywords must be lowercase substrings that actually appear in the '
+        "descriptions above. Cover the data with 5-9 sensible categories (e.g. Payroll, "
+        "Utilities, Groceries, Housing/Rent, Government/HMRC, Transfers, Fees, Cash/ATM). "
+        "If the user named specific categories, use those. Prefer precise, distinctive keywords."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            resp = await client.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": MODEL_PRIMARY,
+                    "messages": [{"role": "system", "content": sys},
+                                 {"role": "user", "content": usr}],
+                    "max_tokens": 900,
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        if resp.status_code != 200:
+            return fallback
+        content = resp.json()["choices"][0]["message"].get("content") or ""
+        parsed = _parse_rules_json(content)
+        if parsed:
+            return parsed[0], parsed[1], "ai-generated"
+        return fallback
+    except Exception:
+        return fallback
+
+
+async def _categorize_shortcircuit(message: str, workspace_id: str | None) -> dict[str, Any] | None:
+    """Run the whole categorise->export job in code. Returns a chat envelope,
+    or None to fall back to the general agent (e.g. nothing to categorise)."""
+    started = time.time()
+    try:
+        datasets = _tool_list_datasets(workspace_id)
+    except Exception:
+        return None
+    parsed = [d for d in datasets if d.get("parsed") and d.get("columns")]
+    if not parsed:
+        return None
+    target = _pick_categorize_dataset(parsed, message)
+    if not target:
+        return None
+    ds_id = target["dataset_id"]
+    try:
+        ds = ensure_parsed(ds_id)
+    except Exception:
+        return None
+    df = ds["df"]
+    source_col = _pick_source_column(df, message)
+    if not source_col:
+        return None
+
+    descs = [str(x) for x in df[source_col].drop_nulls().unique().to_list() if str(x).strip()]
+    rules, default, rule_source = await _generate_rules(descs[:60], message)
+
+    step = {"type": "categorize", "source_column": source_col,
+            "target_column": "Category", "rules": rules, "default": default}
+    working, note = _apply_categorize(df, step)
+    if "skipped" in note:
+        return None
+    ds["cleaned"] = working
+
+    export = _tool_export(ds_id, "xlsx", "cleaned")
+    downloads: list[dict[str, Any]] = []
+    if isinstance(export, dict) and export.get("download_url"):
+        downloads.append({
+            "filename": f"{export.get('exported', 'cleaned')}.{export.get('format', 'xlsx')}",
+            "url": export["download_url"],
+            "format": export.get("format", "xlsx"),
+            "rows": export.get("rows"),
+            "expires_in_seconds": export.get("expires_in_seconds"),
+        })
+
+    counts = note.get("category_counts", {}) or {}
+    if not isinstance(counts, dict):
+        counts = {}
+    total = sum(counts.values()) or working.height or 1
+    ordered = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    breakdown = "\n".join(f"- {cat}: {n}" for cat, n in ordered)
+    fname = target.get("filename") or ds_id
+    warnings: list[str] = []
+
+    if downloads:
+        reply = (f"Added a **Category** column to **{fname}** ({working.height} rows), "
+                 f"read from the `{source_col}` column.\n\n{breakdown}\n\n"
+                 "Your categorised file is ready to download below.")
+        status = "ok"
+        unmatched = counts.get(default, 0)
+        if unmatched and unmatched / total > 0.4:
+            warnings.append(
+                f"{unmatched} of {total} rows ({unmatched * 100 // total}%) didn't match any rule "
+                f"and are labelled '{default}'. Tell me the categories/keywords you want for those "
+                "and I'll refine the file."
+            )
+    else:
+        err = export.get("error") if isinstance(export, dict) else "unknown error"
+        reply = (f"I categorised {working.height} rows of **{fname}** by `{source_col}`, but the "
+                 f"file export failed ({err}).")
+        status = "error"
+        warnings.append("file export failed")
+
+    return {
+        "status": status,
+        "result": {"reply": reply, "downloads": downloads},
+        "evidence": {
+            "tools_used": [{"tool": "categorize_shortcircuit", "dataset_id": ds_id,
+                            "source_column": source_col, "rule_source": rule_source}],
+            "scope": "categorize-shortcircuit",
+        },
+        "warnings": warnings,
+        "execution_metadata": {
+            "duration_ms": int((time.time() - started) * 1000),
+            "model": MODEL_PRIMARY if rule_source == "ai-generated" else "none",
+            "dry_run": False,
+            "mode": "categorize-shortcircuit",
+        },
+    }
+
+
 TOOLS_SPEC = [
     {
         "type": "function",
@@ -630,6 +899,21 @@ async def chat(request: FastAPIRequest,
     # its presence marks an authenticated turn. We do not parse it here (the
     # dashboard owns verification); we record it in evidence.
     evidence_scope = "scope_token present" if scope_token else "no scope token"
+
+    # Fast, reliable path for "categorise this and give me the file". The weak
+    # free model is unreliable at driving the categorise->export tool chain to
+    # completion, so when the turn clearly means that, run the whole job in code
+    # (deterministic engine + at most one bounded rule-generation call) and
+    # return a downloadable file directly. Falls through to the general agent if
+    # there is nothing to categorise.
+    if _wants_categorized_file(message):
+        try:
+            shortcut = await _categorize_shortcircuit(message, workspace_id)
+        except Exception:
+            shortcut = None
+        if shortcut is not None:
+            shortcut["evidence"]["scope"] = evidence_scope
+            return shortcut
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += [
