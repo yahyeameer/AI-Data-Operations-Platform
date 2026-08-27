@@ -63,6 +63,12 @@ about totals, anomalies, duplicates, vendor patterns, and period comparisons.
    clean_dataset / detect_duplicates / validate_dataset. Briefly tell the user what you
    changed and why (e.g. "removed 3 duplicate rows"). Prefer a dry run first for anything
    material; never silently discard data.
+   You CAN also ADD a derived column: to categorise/tag/label rows (e.g. a "Category" column
+   on bank-statement descriptions), use clean_dataset with a {type:'categorize'} step —
+   supply source_column, the target column name, and ordered keyword rules. This writes the
+   new column into the cleaned copy so the categorised file downloads with it. Do NOT tell
+   the user you cannot add a column; you can. Dry-run first, show the category breakdown,
+   then persist and export.
 4. ANSWER FROM DATA. Use query_dataset with SQL (DuckDB/SQLite dialect) against table `ds`
    for every figure. Money columns are Net Sales and VAT unless profile_dataset shows
    otherwise.
@@ -242,6 +248,10 @@ def _tool_clean(ds_id: str, steps: list[dict[str, Any]], dry_run: bool) -> dict[
             working = working.filter(
                 ~pl_all_horizontal_null(working)
             )
+        elif st == "categorize":
+            working, note = _apply_categorize(working, step)
+            applied.append({"type": st, **note})
+            continue
         else:
             applied.append({"type": st, "skipped": "unknown or missing params"})
             continue
@@ -309,6 +319,71 @@ def _tool_export(ds_id: str, fmt: str, which: str) -> dict[str, Any]:
         "expires_in_seconds": 3600,
         "note": f"{label} dataset exported as {fmt}. Give the user the download_url "
                 "(valid ~1 hour). Original upload preserved.",
+    }
+
+
+def _apply_categorize(df, step: dict[str, Any]):
+    """Add a derived label column from ordered keyword rules.
+
+    This is what lets the copilot deliver a *categorised* workbook: it computes
+    a new column (e.g. "Category") on the cleaned copy so export_dataset writes
+    it into the downloaded file. The original upload is never touched.
+
+    step shape:
+      {
+        "type": "categorize",
+        "source_column": "Description",       # column to read (required)
+        "target_column": "Category",           # new column name (default "Category")
+        "rules": [                              # ordered; first match wins
+          {"category": "Payroll", "keywords": ["salary", "wages", "payroll"]},
+          {"category": "Utilities", "keywords": ["edf", "british gas", "water"]}
+        ],
+        "default": "Uncategorised"             # label for unmatched rows
+      }
+
+    Matching is case-insensitive substring on the source column's string form.
+    """
+    import re
+    import polars as pl
+
+    source = step.get("source_column") or step.get("column")
+    target = step.get("target_column") or "Category"
+    rules = step.get("rules") or []
+    default = step.get("default", "Uncategorised")
+
+    if not source or source not in df.columns:
+        return df, {"skipped": f"source_column '{source}' not found"}
+    if not isinstance(rules, list) or not rules:
+        return df, {"skipped": "no rules provided"}
+
+    src = pl.col(source).cast(pl.Utf8).fill_null("")
+    expr = pl.lit(default)
+    valid_rules = 0
+    # Build the when/then chain in reverse so that earlier (higher-priority)
+    # rules end up outermost and win over later ones.
+    for rule in reversed(rules):
+        cat = (rule or {}).get("category")
+        keywords = (rule or {}).get("keywords") or []
+        terms = [str(k) for k in keywords if str(k).strip()]
+        if not cat or not terms:
+            continue
+        pattern = "(?i)" + "|".join(re.escape(t) for t in terms)
+        expr = pl.when(src.str.contains(pattern)).then(pl.lit(cat)).otherwise(expr)
+        valid_rules += 1
+
+    if valid_rules == 0:
+        return df, {"skipped": "no valid rules (each needs category + keywords)"}
+
+    out = df.with_columns(expr.alias(target))
+    counts = {
+        row[target]: row["n"]
+        for row in out.group_by(target).agg(pl.len().alias("n")).to_dicts()
+    }
+    return out, {
+        "added_column": target,
+        "from_column": source,
+        "rules_applied": valid_rules,
+        "category_counts": counts,
     }
 
 
@@ -395,10 +470,17 @@ TOOLS_SPEC = [
         "function": {
             "name": "clean_dataset",
             "description": (
-                "Apply cleaning steps to a dataset, writing to a cleaned copy "
+                "Apply cleaning/derivation steps to a dataset, writing to a cleaned copy "
                 "(the original is preserved). Steps: {type:'dedupe'}, "
-                "{type:'drop_nulls', column:'<col>'}, {type:'drop_empty_rows'}. "
-                "ALWAYS call once with dry_run=true first to preview the row impact, "
+                "{type:'drop_nulls', column:'<col>'}, {type:'drop_empty_rows'}, and "
+                "{type:'categorize', source_column:'<col>', target_column:'Category', "
+                "rules:[{category:'Payroll', keywords:['salary','wages']}, ...], "
+                "default:'Uncategorised'} which ADDS a new label column derived from "
+                "keyword matches (case-insensitive substring, first matching rule wins). "
+                "Use 'categorize' when the user asks to categorise/tag/label rows and get "
+                "the categorised file back — it writes the new column into the cleaned copy "
+                "so export_dataset includes it. "
+                "ALWAYS call once with dry_run=true first to preview the impact, "
                 "tell the user, then call with dry_run=false to persist."
             ),
             "parameters": {
@@ -412,9 +494,36 @@ TOOLS_SPEC = [
                             "properties": {
                                 "type": {
                                     "type": "string",
-                                    "enum": ["dedupe", "drop_nulls", "drop_empty_rows"],
+                                    "enum": ["dedupe", "drop_nulls", "drop_empty_rows", "categorize"],
                                 },
                                 "column": {"type": "string"},
+                                "source_column": {
+                                    "type": "string",
+                                    "description": "categorize: column to read text from.",
+                                },
+                                "target_column": {
+                                    "type": "string",
+                                    "description": "categorize: name of the new column (default 'Category').",
+                                },
+                                "default": {
+                                    "type": "string",
+                                    "description": "categorize: label for rows matching no rule (default 'Uncategorised').",
+                                },
+                                "rules": {
+                                    "type": "array",
+                                    "description": "categorize: ordered rules; first match wins.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "category": {"type": "string"},
+                                            "keywords": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        },
+                                        "required": ["category", "keywords"],
+                                    },
+                                },
                             },
                             "required": ["type"],
                         },
