@@ -582,39 +582,162 @@ async def _generate_rules(descriptions: list[str], message: str):
         return fallback
 
 
-async def _categorize_shortcircuit(message: str, workspace_id: str | None) -> dict[str, Any] | None:
+# Adjustment-language a user uses to refine an existing categorisation, e.g.
+# "put HMRC NDDS under Government too", "the ATM ones should be Cash",
+# "move Amazon into Shopping", "reclassify the ? rows as Other".
+_REFINE_HINTS = [
+    "recategor", "re-categor", "reclassif", "re-classif", "should be",
+    "should go", "move ", "put ", " under ", "instead", "rename",
+    "relabel", "re-label", "merge ", "combine", "change ", "add a categor",
+    "add category", "also label", "also tag", "belongs", "classify the",
+    "the ? ", "'?'", "\"?\"", "unmatched", "uncategor", "wrong categor",
+    "fix the categor", "not ", "these are", "that's ", "those are",
+]
+
+
+def _looks_like_refine(message: str) -> bool:
+    """Heuristic: does this turn look like a follow-up adjustment to a prior
+    categorisation (rather than a fresh request or an unrelated question)?"""
+    m = (message or "").lower().strip()
+    if not m:
+        return False
+    return any(h in m for h in _REFINE_HINTS)
+
+
+def _find_recent_categorized(workspace_id: str | None) -> tuple[str, dict[str, Any]] | None:
+    """Most-recently categorised dataset in this workspace that still holds its
+    rule state, so a refine turn knows what it is adjusting."""
+    best: tuple[float, str, dict[str, Any]] | None = None
+    for ds_id, ds in DATASETS.items():
+        state = ds.get("cat_state")
+        if not state:
+            continue
+        if workspace_id and ds.get("workspace_id") not in (None, workspace_id):
+            continue
+        when = float(state.get("at") or 0.0)
+        if best is None or when > best[0]:
+            best = (when, ds_id, ds)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+async def _refine_rules(existing_rules: list[dict[str, Any]], default: str,
+                        descriptions: list[str], message: str):
+    """One bounded model call to EDIT existing keyword rules per the user's
+    adjustment instruction. Falls back to the unchanged rules on any problem
+    (safe: never loses the prior categorisation). Returns (rules, default, source)."""
+    fallback = (existing_rules, default, "unchanged")
+    if not OPENROUTER_API_KEY or not existing_rules:
+        return fallback
+    sample = "\n".join("- " + d[:80] for d in descriptions[:60])
+    current = json.dumps({"rules": existing_rules, "default": default})
+    sys = ("You edit an existing set of keyword rules that categorise UK "
+           "bank-statement transactions, applying the user's adjustment. "
+           "Output ONLY a JSON object, no prose and no markdown fences.")
+    usr = (
+        f"Current rules JSON:\n{current}\n\n"
+        f"Distinct transaction descriptions in the data:\n{sample}\n\n"
+        f"User adjustment: {message}\n\n"
+        "Apply the adjustment by editing the rules: add/rename/merge categories or "
+        "move keywords as asked, and KEEP everything the user did not mention. "
+        'Return the FULL updated JSON exactly like {"rules":[{"category":"Name",'
+        '"keywords":["lower","substrings"]}],"default":"?"}. Keywords must be lowercase '
+        "substrings that actually appear in the descriptions above."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            resp = await client.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": MODEL_PRIMARY,
+                    "messages": [{"role": "system", "content": sys},
+                                 {"role": "user", "content": usr}],
+                    "max_tokens": 1000,
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        if resp.status_code != 200:
+            return fallback
+        content = resp.json()["choices"][0]["message"].get("content") or ""
+        parsed = _parse_rules_json(content)
+        if parsed:
+            return parsed[0], parsed[1], "ai-refined"
+        return fallback
+    except Exception:
+        return fallback
+
+
+async def _categorize_shortcircuit(message: str, workspace_id: str | None,
+                                   refine: bool = False) -> dict[str, Any] | None:
     """Run the whole categorise->export job in code. Returns a chat envelope,
-    or None to fall back to the general agent (e.g. nothing to categorise)."""
+    or None to fall back to the general agent (e.g. nothing to categorise).
+
+    refine=True adjusts a PRIOR categorisation: it targets the dataset that
+    still holds its rule state and edits those rules per the user's instruction,
+    instead of generating a fresh rule set from scratch.
+    """
     started = time.time()
-    try:
-        datasets = _tool_list_datasets(workspace_id)
-    except Exception:
-        return None
-    parsed = [d for d in datasets if d.get("parsed") and d.get("columns")]
-    if not parsed:
-        return None
-    target = _pick_categorize_dataset(parsed, message)
-    if not target:
-        return None
-    ds_id = target["dataset_id"]
-    try:
-        ds = ensure_parsed(ds_id)
-    except Exception:
-        return None
+
+    prior_state: dict[str, Any] | None = None
+    if refine:
+        found = _find_recent_categorized(workspace_id)
+        if not found:
+            return None  # nothing to refine -> let the agent handle it
+        ds_id, ds = found
+        try:
+            ds = ensure_parsed(ds_id)
+        except Exception:
+            return None
+        prior_state = ds.get("cat_state") or {}
+        target = {"dataset_id": ds_id, "filename": ds.get("filename")}
+    else:
+        try:
+            datasets = _tool_list_datasets(workspace_id)
+        except Exception:
+            return None
+        parsed = [d for d in datasets if d.get("parsed") and d.get("columns")]
+        if not parsed:
+            return None
+        target = _pick_categorize_dataset(parsed, message)
+        if not target:
+            return None
+        ds_id = target["dataset_id"]
+        try:
+            ds = ensure_parsed(ds_id)
+        except Exception:
+            return None
+
     df = ds["df"]
-    source_col = _pick_source_column(df, message)
-    if not source_col:
+    if refine and prior_state:
+        source_col = prior_state.get("source_col") or _pick_source_column(df, message)
+    else:
+        source_col = _pick_source_column(df, message)
+    if not source_col or source_col not in df.columns:
         return None
 
     descs = [str(x) for x in df[source_col].drop_nulls().unique().to_list() if str(x).strip()]
-    rules, default, rule_source = await _generate_rules(descs[:60], message)
 
+    if refine and prior_state:
+        rules, default, rule_source = await _refine_rules(
+            prior_state.get("rules") or [], prior_state.get("default", "?"),
+            descs[:60], message)
+    else:
+        rules, default, rule_source = await _generate_rules(descs[:60], message)
+
+    target_col = (prior_state or {}).get("target") or "Category"
     step = {"type": "categorize", "source_column": source_col,
-            "target_column": "Category", "rules": rules, "default": default}
+            "target_column": target_col, "rules": rules, "default": default}
     working, note = _apply_categorize(df, step)
     if "skipped" in note:
         return None
     ds["cleaned"] = working
+    # Persist the rule state so a later turn can refine it.
+    ds["cat_state"] = {"source_col": source_col, "target": target_col,
+                       "rules": rules, "default": default, "at": time.time()}
 
     export = _tool_export(ds_id, "xlsx", "cleaned")
     downloads: list[dict[str, Any]] = []
@@ -637,9 +760,21 @@ async def _categorize_shortcircuit(message: str, workspace_id: str | None) -> di
     warnings: list[str] = []
 
     if downloads:
-        reply = (f"Added a **Category** column to **{fname}** ({working.height} rows), "
-                 f"read from the `{source_col}` column.\n\n{breakdown}\n\n"
-                 "Your categorised file is ready to download below.")
+        if refine:
+            if rule_source == "unchanged":
+                lead = (f"I couldn't automatically apply that adjustment to **{fname}**, so "
+                        f"the categories are unchanged. Try naming the exact category and a word "
+                        f"from the transactions, e.g. \u201clabel anything with \u2018HMRC\u2019 as Government\u201d.")
+                warnings.append("refinement could not be applied automatically")
+            else:
+                lead = (f"Updated the categories on **{fname}** ({working.height} rows) per your "
+                        f"change.")
+        else:
+            lead = (f"Added a **{target_col}** column to **{fname}** ({working.height} rows), "
+                    f"read from the `{source_col}` column.")
+        reply = (f"{lead}\n\n{breakdown}\n\n"
+                 "Your categorised file is ready to download below. "
+                 "Want to adjust any category? Just tell me (e.g. \u201cmove ATM to Cash\u201d).")
         status = "ok"
         unmatched = counts.get(default, 0)
         if unmatched and unmatched / total > 0.4:
@@ -660,15 +795,16 @@ async def _categorize_shortcircuit(message: str, workspace_id: str | None) -> di
         "result": {"reply": reply, "downloads": downloads},
         "evidence": {
             "tools_used": [{"tool": "categorize_shortcircuit", "dataset_id": ds_id,
-                            "source_column": source_col, "rule_source": rule_source}],
+                            "source_column": source_col, "rule_source": rule_source,
+                            "refine": refine}],
             "scope": "categorize-shortcircuit",
         },
         "warnings": warnings,
         "execution_metadata": {
             "duration_ms": int((time.time() - started) * 1000),
-            "model": MODEL_PRIMARY if rule_source == "ai-generated" else "none",
+            "model": MODEL_PRIMARY if rule_source in ("ai-generated", "ai-refined") else "none",
             "dry_run": False,
-            "mode": "categorize-shortcircuit",
+            "mode": "categorize-refine" if refine else "categorize-shortcircuit",
         },
     }
 
@@ -914,6 +1050,19 @@ async def chat(request: FastAPIRequest,
         if shortcut is not None:
             shortcut["evidence"]["scope"] = evidence_scope
             return shortcut
+
+    # Conversational refine loop: a short follow-up like "move ATM to Cash" or
+    # "the HMRC ones should be Government" adjusts the PRIOR categorisation and
+    # returns an updated file. Only engages when this workspace actually has a
+    # categorised dataset with saved rule state; otherwise falls through.
+    if _looks_like_refine(message) and _find_recent_categorized(workspace_id) is not None:
+        try:
+            refined = await _categorize_shortcircuit(message, workspace_id, refine=True)
+        except Exception:
+            refined = None
+        if refined is not None:
+            refined["evidence"]["scope"] = evidence_scope
+            return refined
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += [
