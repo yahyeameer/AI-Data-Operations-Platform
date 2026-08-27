@@ -153,6 +153,44 @@ export function isChatAvailable(): boolean {
   return isHermesConfigured() || isLocalChatConfigured();
 }
 
+/**
+ * Fire-and-forget wake-up for the hosted parser.
+ *
+ * Render's free tier sleeps after ~15 min idle and takes 30-60s to wake. If a
+ * user's first analysis turn is what wakes it, that turn eats the cold start on
+ * top of its own work and can cross the serverless function's wall-clock cap.
+ * Calling this the moment the chat screen mounts starts the wake while the user
+ * is still reading the page or typing, so by the time they hit send the parser
+ * is (usually) already up and the turn runs warm.
+ *
+ * Deliberately tolerant: any outcome resolves to a boolean and never throws.
+ * Waking is best-effort; a failed ping must not surface to the user, and the
+ * keep-warm cron plus the defensive chat client are the real guarantees.
+ *
+ * Uses a longer timeout than the health check (which aborts at 5s and would
+ * give up mid-wake) precisely because the point here is to hold the request
+ * open long enough for Render to finish spinning up.
+ */
+export async function wakeParser(): Promise<boolean> {
+  const base = endpoint();
+  if (!base || !isHermesConfigured()) return false;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 70_000);
+  try {
+    const response = await fetch(`${base}/health`, {
+      headers: { authorization: `Bearer ${process.env.HERMES_API_SECRET}` },
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function call<T>(
   path: string,
   payload: unknown,

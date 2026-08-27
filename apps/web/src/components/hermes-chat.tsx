@@ -97,6 +97,25 @@ export function HermesChat({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [turns, upload]);
 
+  // Wake the parser the instant this screen mounts. On Render's free tier the
+  // analysis service sleeps after ~15 min idle; kicking off the cold start now,
+  // while the accountant is still reading the page and typing, means their
+  // first question usually meets a warm parser instead of paying the 30-60s
+  // wake on top of the analysis. Fire-and-forget: the wake is advisory, so its
+  // outcome is deliberately ignored and never blocks or interrupts the UI.
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch('/api/hermes/wake', {
+      method: 'POST',
+      cache: 'no-store',
+      signal: controller.signal,
+    }).catch(() => {
+      // Waking is best-effort; the keep-warm cron and the defensive send()
+      // handler are the real guarantees. A failed ping is a non-event here.
+    });
+    return () => controller.abort();
+  }, []);
+
   async function send(text?: string) {
     const message = (text ?? draft).trim();
     if (!message || busy) return;
