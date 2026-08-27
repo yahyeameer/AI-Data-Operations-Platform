@@ -535,6 +535,101 @@ async def run_tool(tool: str, request: Request,
     raise HTTPException(404, f"unknown tool '{tool}'")
 
 
+# ---------------------------------------------------------------------------
+# Deterministic categorize + export (no LLM, no tokens).
+#
+# The chat model can categorise in prose but is unreliable at driving the
+# multi-step clean->export tool chain to completion. This endpoint does the
+# whole job in code: add a derived label column from keyword rules, persist it
+# to the cleaned copy (original never mutated), export to Supabase Storage, and
+# return a signed download URL. Same building blocks the chat tools use, so the
+# result is identical -- just guaranteed to finish. Used by the Hermes backend
+# loop and callable directly by the dashboard.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/categorize")
+async def categorize_and_export(request: Request,
+                                authorization: str | None = Header(default=None)):
+    check_secret(authorization, f"Bearer {HERMES_API_SECRET}" if HERMES_API_SECRET else "",
+                 "HERMES_API_SECRET")
+    body = await request.json()
+    dataset_id = body.get("dataset_id")
+    if not dataset_id:
+        raise HTTPException(400, "dataset_id is required")
+
+    source_column = body.get("source_column")
+    target_column = body.get("target_column") or "Category"
+    rules = body.get("rules") or []
+    default = body.get("default", "Uncategorised")
+    fmt = (body.get("format") or "xlsx").lower()
+
+    # Reuse the verified chat-layer implementations. Imported here (not at module
+    # top) because chat imports from main -- a top-level import would be circular.
+    try:
+        from .chat import _apply_categorize, _tool_export
+    except ImportError:
+        from chat import _apply_categorize, _tool_export
+
+    ds = ensure_parsed(dataset_id)
+
+    # If the caller did not name a source column, pick the most text-like one
+    # (the description/narrative column on a bank statement). Deterministic:
+    # the widest-average-length Utf8 column.
+    if not source_column:
+        candidates = [c for c in ds["df"].columns if str(ds["df"][c].dtype) == "Utf8"]
+        if not candidates:
+            candidates = list(ds["df"].columns)
+        best, best_len = None, -1.0
+        for c in candidates:
+            try:
+                avg = ds["df"][c].cast(pl_str()).str.len_chars().mean() or 0.0
+            except Exception:
+                avg = 0.0
+            if avg > best_len:
+                best, best_len = c, avg
+        source_column = best
+
+    if not rules:
+        raise HTTPException(400, "rules are required (list of {category, keywords})")
+
+    step = {
+        "type": "categorize",
+        "source_column": source_column,
+        "target_column": target_column,
+        "rules": rules,
+        "default": default,
+    }
+    working, note = _apply_categorize(ds["df"], step)
+    if "skipped" in note:
+        raise HTTPException(400, f"categorize skipped: {note['skipped']}")
+
+    ds["cleaned"] = working
+    export = _tool_export(dataset_id, fmt, "cleaned")
+    if isinstance(export, dict) and export.get("error"):
+        raise HTTPException(503, export["error"])
+
+    return {
+        "status": "result",
+        "result": {
+            "categorized": note,
+            "download_url": export.get("download_url"),
+            "filename": f"{export.get('exported', 'cleaned')}.{export.get('format', fmt)}",
+            "format": export.get("format", fmt),
+            "rows": export.get("rows"),
+            "bucket": export.get("bucket"),
+            "path": export.get("path"),
+            "expires_in_seconds": export.get("expires_in_seconds"),
+        },
+        "evidence": {"tool": "categorize_and_export", "dataset_id": dataset_id,
+                     "source_column": source_column},
+    }
+
+
+def pl_str():
+    import polars as pl
+    return pl.Utf8
+
+
 # Import chat so its decorators register /api/v1/chat and extended /health on this app instance
 try:
     from . import chat  # noqa: E402,F401
