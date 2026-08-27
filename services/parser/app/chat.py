@@ -648,6 +648,21 @@ async def chat(request: FastAPIRequest,
     downloads: list[dict[str, Any]] = []
     reply_text = ""
 
+    # Whether the user's turn asks for a produced artifact / mutation (a file,
+    # a categorised/cleaned/exported workbook). Weak free models often gather
+    # the data and then narrate a *plan* in prose instead of calling the tool
+    # that does the work. When that happens we nudge once or twice to force the
+    # action rather than returning the plan as if it were the result.
+    _m = message.lower()
+    action_requested = any(
+        k in _m for k in (
+            "categori", "clean", "dedup", "download", "export",
+            "give me the file", "the file", "xlsx", "csv", "spreadsheet",
+        )
+    )
+    forced_nudges = 0
+    MAX_FORCED_NUDGES = 2
+
     async with httpx.AsyncClient(timeout=60) as client:
         url = f"{OPENROUTER_BASE_URL}/chat/completions"
         used_model = MODEL_PRIMARY
@@ -678,7 +693,29 @@ async def chat(request: FastAPIRequest,
             calls = choice.get("tool_calls") or []
 
             if not calls:
-                reply_text = (choice.get("content") or "").strip() or (choice.get("reasoning") or "").strip()
+                candidate = (choice.get("content") or "").strip() or (choice.get("reasoning") or "").strip()
+                # The model stopped without calling a tool. If the user asked us
+                # to produce a file/mutation and we have not yet produced a
+                # download, the model has almost certainly narrated a plan
+                # instead of executing it. Force the action rather than handing
+                # the plan back as the answer.
+                if action_requested and not downloads and forced_nudges < MAX_FORCED_NUDGES:
+                    forced_nudges += 1
+                    messages.append(choice)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You have NOT completed the task — you only described a plan. "
+                            "Do not reply with prose. Execute now by calling the tools: to "
+                            "categorise, call clean_dataset with a categorize step "
+                            "(source_column, target_column, your keyword rules) and "
+                            "dry_run=false; then call export_dataset (format 'xlsx'). Only "
+                            "after the file is exported, give a 2-3 line reply with the "
+                            "category breakdown. Act now."
+                        ),
+                    })
+                    continue
+                reply_text = candidate
                 break
 
             messages.append(choice)
