@@ -67,8 +67,14 @@ about totals, anomalies, duplicates, vendor patterns, and period comparisons.
    on bank-statement descriptions), use clean_dataset with a {type:'categorize'} step —
    supply source_column, the target column name, and ordered keyword rules. This writes the
    new column into the cleaned copy so the categorised file downloads with it. Do NOT tell
-   the user you cannot add a column; you can. Dry-run first, show the category breakdown,
-   then persist and export.
+   the user you cannot add a column; you can.
+   IMPORTANT for speed: categorize is ADDITIVE (it removes no rows), so it does NOT need a
+   dry-run — when the user asks to categorise and get the file, DO IT IN ONE PASS: quickly
+   profile the source column if needed, then call clean_dataset with the categorize step and
+   dry_run=FALSE, then call export_dataset, then reply. Design sensible keyword rules
+   yourself from the descriptions; do NOT deliberate at length or ask the user to approve
+   the rules unless they are genuinely ambiguous. Keep any explanation to 2-3 short lines
+   plus the category breakdown — never narrate your rule design in the reply.
 4. ANSWER FROM DATA. Use query_dataset with SQL (DuckDB/SQLite dialect) against table `ds`
    for every figure. Money columns are Net Sales and VAT unless profile_dataset shows
    otherwise.
@@ -480,8 +486,10 @@ TOOLS_SPEC = [
                 "Use 'categorize' when the user asks to categorise/tag/label rows and get "
                 "the categorised file back — it writes the new column into the cleaned copy "
                 "so export_dataset includes it. "
-                "ALWAYS call once with dry_run=true first to preview the impact, "
-                "tell the user, then call with dry_run=false to persist."
+                "For row-removing steps (dedupe, drop_nulls, drop_empty_rows) ALWAYS call "
+                "once with dry_run=true first to preview the impact, tell the user, then call "
+                "with dry_run=false to persist. The categorize step is additive (removes no "
+                "rows) — skip the dry-run and call it directly with dry_run=false."
             ),
             "parameters": {
                 "type": "object",
