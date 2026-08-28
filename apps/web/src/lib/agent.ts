@@ -34,6 +34,7 @@ export const JOB_KIND_LABELS: Record<AgentJobKind, string> = {
   profile_dataset: 'Profiling the data',
   propose_cleaning: 'Working out what to fix',
   apply_cleaning: 'Applying approved changes',
+  replay_recipe: 'Replaying the saved recipe',
   query_dataset: 'Answering a question',
   reconcile_sources: 'Reconciling two sources',
   generate_report: 'Writing the report',
