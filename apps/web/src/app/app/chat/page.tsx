@@ -6,7 +6,6 @@ import { HermesChat } from '@/components/hermes-chat';
 import { StatementUpload } from '@/components/statement-upload';
 import { Card, EmptyState, PageHeader } from '@/components/ui';
 import { requireCurrentOrg } from '@/lib/authz';
-import { isChatAvailable, isHermesConfigured } from '@/lib/hermes';
 import { createServerSupabase } from '@/lib/supabase/server';
 
 export const metadata = { title: 'AI Bank Statement Analyzer · AnalyzeIt' };
@@ -104,35 +103,18 @@ export default async function AnalyzerPage({
 
       <AnalyzerIntro />
 
-      {/* Three states: full analysis (parser hosted), conversational-only
-          (OpenRouter but no parser), or nothing configured. */}
-      {!isChatAvailable() ? (
-        <Card className="border-amber-500/30">
-          <p className="text-sm font-semibold text-amber-300">Chat is not connected yet</p>
-          <p className="mt-1.5 text-xs leading-relaxed text-slate-400">
-            This deployment has no chat provider configured, so questions cannot be answered.
-            Statements can still be uploaded. An administrator needs to set{' '}
-            <code className="text-slate-300">OPENROUTER_API_KEY</code> (conversational) or{' '}
-            <code className="text-slate-300">HERMES_AGENT_ENDPOINT</code> +{' '}
-            <code className="text-slate-300">HERMES_API_SECRET</code> (full analysis) — see{' '}
-            <code className="text-slate-300">HERMES_DASHBOARD_INTEGRATION.md</code>.
-          </p>
-        </Card>
-      ) : (
-        !isHermesConfigured() && (
-          <Card className="border-sky-500/30">
-            <p className="text-sm font-semibold text-sky-300">Conversational mode</p>
-            <p className="mt-1.5 text-xs leading-relaxed text-slate-400">
-              You can chat with the copilot about your workflow and how to use the tool. The
-              data-analysis engine that reads and computes over uploaded statements is not
-              connected to this deployment yet, so the copilot will not quote figures from a
-              file until an administrator sets{' '}
-              <code className="text-slate-300">HERMES_AGENT_ENDPOINT</code>. Uploads are stored
-              and will be analyzable once it is connected.
-            </p>
-          </Card>
-        )
-      )}
+      {/* No availability banner any more, and the absence is the point.
+          The dashboard used to read HERMES_AGENT_ENDPOINT and OPENROUTER_API_KEY
+          to decide up front whether chat could work -- it had to, because it was
+          about to call the engine directly and needed somewhere to call. It no
+          longer calls anything: a question becomes a row, and the worker answers
+          it whenever it can.
+          That makes "is the engine configured?" a question the dashboard cannot
+          answer and does not need to. If no model is set on the engine host, the
+          worker fails that job with a message saying exactly that, and it lands
+          in the transcript where the user is already looking -- rather than as a
+          banner that has to be kept in sync with a host the dashboard cannot
+          see. */}
 
       {/* Client selector. Links rather than a client-side control so the chosen
           client is in the URL -- shareable, and correct after a reload. */}

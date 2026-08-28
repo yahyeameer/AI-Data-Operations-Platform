@@ -2,18 +2,32 @@
 
 import { useEffect, useRef, useState } from 'react';
 
+import { createBrowserSupabase } from '@/lib/supabase/client';
+
 /**
- * Watching an analysis.
+ * Watching a job.
  *
- * The browser polls because the work no longer happens inside a request. That
- * is the whole point of the change: the engine may be asleep, cold-starting or
- * mid-redeploy when the job is queued, and none of those are errors any more --
- * they are reasons the answer takes a little longer to arrive.
+ * The row in `agent_jobs` is the source of truth and Postgres knows the instant
+ * it changes, so the browser subscribes rather than asking repeatedly. The
+ * answer then appears when it happens instead of up to a poll interval later,
+ * and an idle dashboard stops generating requests.
  *
- * So this hook deliberately has no timeout of its own. A spinner that gives up
- * after 60 seconds would reintroduce, in the client, exactly the deadline the
- * queue was built to remove. It stops when the job reaches a terminal state and
- * not before; the user can always navigate away.
+ * RLS governs the subscription exactly as it governs a SELECT -- Realtime
+ * evaluates `agent_jobs_select_members` per subscriber -- so this cannot be
+ * used to watch another firm's work.
+ *
+ * Two things are deliberate.
+ *
+ * **There is no timeout.** The engine may be asleep, cold-starting or
+ * mid-redeploy when a job is queued, and none of those are errors. A spinner
+ * that gave up after sixty seconds would reintroduce, in the client, precisely
+ * the deadline the queue was built to remove.
+ *
+ * **A slow poll runs alongside the subscription.** A websocket can drop without
+ * saying so, and a missed terminal event would leave the user watching a
+ * spinner for work that finished. The poll is the floor under the socket, not
+ * the mechanism -- it also carries engine liveness, which has no row of its own
+ * to subscribe to.
  */
 
 export type FindingTier = 'block' | 'review' | 'routine';
@@ -68,6 +82,9 @@ type Worker = { id: string; version: string | null; last_seen_at: string };
  */
 const WORKER_STALE_AFTER_MS = 90_000;
 
+/** The socket is the mechanism; this is the floor under it. */
+const FALLBACK_POLL_MS = 15_000;
+
 export function isEngineAwake(workers: Worker[]): boolean {
   return workers.some(
     (worker) => Date.now() - new Date(worker.last_seen_at).getTime() < WORKER_STALE_AFTER_MS,
@@ -83,21 +100,21 @@ const STAGE_LABELS: Record<string, string> = {
   downloading: 'Reading the file',
   reading: 'Interpreting the workbook',
   analysing: 'Checking the figures',
+  thinking: 'Thinking',
 };
 
 export function stageLabel(job: AnalysisJob | null): string {
   if (!job) return '';
   if (job.status === 'queued') return 'Waiting for the engine';
   const stage = typeof job.progress?.stage === 'string' ? job.progress.stage : '';
-  return STAGE_LABELS[stage] ?? 'Analyzing';
+  return STAGE_LABELS[stage] ?? 'Working';
 }
 
-export function useAnalysisJob(jobId: string | null, intervalMs = 2000) {
+export function useAnalysisJob(jobId: string | null) {
   const [job, setJob] = useState<AnalysisJob | null>(null);
   const [engineAwake, setEngineAwake] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Held in a ref so the polling effect does not re-subscribe every tick.
-  const stopped = useRef(false);
+  const finished = useRef(false);
 
   useEffect(() => {
     if (!jobId) {
@@ -106,40 +123,65 @@ export function useAnalysisJob(jobId: string | null, intervalMs = 2000) {
       return;
     }
 
-    stopped.current = false;
-    let timer: ReturnType<typeof setTimeout>;
+    finished.current = false;
+    let poll: ReturnType<typeof setTimeout>;
 
-    async function poll() {
-      if (stopped.current) return;
-
+    /**
+     * One read through the route, which returns the job and engine liveness
+     * together. Used for the initial state -- the job may already be terminal
+     * before the subscription is open -- and as the fallback tick.
+     */
+    async function refresh() {
       try {
         const response = await fetch(`/api/analyze/${jobId}`, { cache: 'no-store' });
         const body = await response.json();
-
         if (!response.ok) throw new Error(body.error ?? 'Could not read the analysis');
 
-        setJob(body.job);
         setEngineAwake(isEngineAwake(body.workers ?? []));
         setError(null);
-
-        if (isTerminal(body.job.status)) return;
+        apply(body.job as AnalysisJob);
       } catch (caught) {
-        // A failed poll is not a failed analysis -- the job is safe in the
-        // database and the next tick will pick it up. Surface it without
-        // stopping, so a flaky connection does not look like a lost run.
+        // A failed read is not a failed job -- the row is safe in the database.
+        // Surface it without stopping, so a flaky connection does not look like
+        // a lost run.
         setError(caught instanceof Error ? caught.message : 'Could not read the analysis');
       }
 
-      timer = setTimeout(poll, intervalMs);
+      if (!finished.current) poll = setTimeout(refresh, FALLBACK_POLL_MS);
     }
 
-    poll();
+    function apply(next: AnalysisJob) {
+      setJob(next);
+      if (isTerminal(next.status)) {
+        finished.current = true;
+        clearTimeout(poll);
+      }
+    }
+
+    const supabase = createBrowserSupabase();
+    const channel = supabase
+      .channel(`agent_job:${jobId}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'agent_jobs', filter: `id=eq.${jobId}` },
+        (payload) => {
+          // replica identity is FULL on this table, so an update carries the
+          // whole row -- the findings arrive in the same event that reports
+          // success, rather than needing a follow-up fetch.
+          apply(payload.new as AnalysisJob);
+          setError(null);
+        },
+      )
+      .subscribe();
+
+    refresh();
 
     return () => {
-      stopped.current = true;
-      clearTimeout(timer);
+      finished.current = true;
+      clearTimeout(poll);
+      supabase.removeChannel(channel);
     };
-  }, [jobId, intervalMs]);
+  }, [jobId]);
 
   return { job, engineAwake, error };
 }

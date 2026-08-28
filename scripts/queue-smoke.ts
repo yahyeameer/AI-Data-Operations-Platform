@@ -291,6 +291,12 @@ async function main() {
 
   // -- report ---------------------------------------------------------------
 
+  // Remove the synthetic worker row this run registered. It is only a
+  // heartbeat, but a fresh one left behind makes `test:cold-start` skip -- and a
+  // suite that quietly skips its own regression test is worse than one that
+  // fails.
+  await admin.from('agent_workers').delete().eq('id', workerId);
+
   console.log(`\n${passed} passed, ${failures.length} failed\n`);
   if (failures.length) {
     for (const failure of failures) console.log(`  - ${failure}`);

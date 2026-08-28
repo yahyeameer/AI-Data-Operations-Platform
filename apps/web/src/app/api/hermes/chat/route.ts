@@ -4,30 +4,35 @@ import { z } from 'zod';
 import { handleRouteError } from '@/lib/api';
 import { adminFor, requireWorkspaceAccess } from '@/lib/authz';
 import { createServerSupabase } from '@/lib/supabase/server';
-import { RAW_BUCKET } from '@/lib/storage';
-import { isParserConfigured, pushWorkbook } from '@/lib/parser-client';
-import type { Json } from '@/lib/database.types';
-import { HermesError, hermesChat, isChatAvailable } from '@/lib/hermes';
 
 /**
- * The customer-facing chat turn (PRD v3 section 4).
+ * A chat turn, queued.
  *
- * Order matters here and is not negotiable: prove workspace access first, then
- * talk to the agent. The workspace id arrives from the browser, so until
- * requireWorkspaceAccess has run it is a claim, not a fact -- and forwarding an
- * unproven id to an agent that can read client financial data is precisely the
- * cross-tenant leak the isolation tests exist to catch.
+ * This route used to hold the conversation open: it pushed every stored upload
+ * to the parser, then called it and waited for the model to finish a multi-round
+ * tool loop before replying. That is what produced *"The analysis is taking
+ * longer than this plan allows."* The function's own comment set
+ * `maxDuration = 60` and noted that Hobby would not allow more, while
+ * `lib/hermes.ts` was willing to wait 300 seconds -- so Vercel always won, killed
+ * the function, and returned a plain-text error page that broke `JSON.parse` in
+ * the chat component.
  *
- * Every turn is audited. Section 17 asks for an immutable audit trail, and a
- * question an accountant asked about a client's numbers belongs in it just as
- * much as an upload does.
+ * There is nothing to time out now. The turn becomes a row in `agent_jobs` and
+ * this returns a job id; the worker runs the loop on a host with no deadline,
+ * and the browser watches the row over Realtime. A model that thinks for four
+ * minutes now costs the user four minutes of waiting instead of an error at
+ * sixty seconds.
+ *
+ * The upload push is gone too. The worker reads from Supabase Storage itself, so
+ * copying every recent workbook through this function on every single message
+ * was buying nothing but latency and a body-size ceiling.
+ *
+ * Order still matters and is not negotiable: prove workspace access first. The
+ * workspace id arrives from the browser, so until `requireWorkspaceAccess` has
+ * run it is a claim, not a fact -- and `enqueue_agent_job` then re-checks
+ * membership from `auth.uid()` independently, which is the second half of
+ * "RLS plus server-side authorization on every path".
  */
-
-// The parser runs a multi-round tool loop and, on Render's free tier, may
-// cold-start before it begins. Give the function the most wall-clock the plan
-// allows so it waits for the parser rather than aborting mid-analysis.
-// Hobby caps at 60s (a higher value fails the build); Pro/Fluid allow up to 300.
-export const maxDuration = 60;
 
 const requestSchema = z.object({
   workspaceId: z.string().uuid(),
@@ -47,92 +52,46 @@ export async function POST(request: Request) {
   try {
     const body = requestSchema.parse(await request.json());
 
-    // Authorize before anything else touches the agent.
     const context = await requireWorkspaceAccess(body.workspaceId);
+    const supabase = await createServerSupabase();
 
-    if (!isChatAvailable()) {
-      return NextResponse.json(
-        {
-          error:
-            'Chat is not connected to this deployment yet. An administrator needs to set ' +
-            'OPENROUTER_API_KEY (conversational) or HERMES_AGENT_ENDPOINT + HERMES_API_SECRET (full analysis).',
-        },
-        { status: 503 },
-      );
-    }
-
-    // If the parser is configured, ensure any stored uploads for this workspace are pushed to the parser
-    if (isParserConfigured()) {
-      try {
-        const supabase = await createServerSupabase();
-        const { data: uploads } = await supabase
-          .from('raw_uploads')
-          .select('id, dataset_id, storage_path, original_filename')
-          .eq('workspace_id', context.workspaceId)
-          .eq('status', 'stored')
-          .order('created_at', { ascending: false })
-          .limit(5);
-
-        if (uploads && uploads.length > 0) {
-          for (const up of uploads) {
-            const key = up.dataset_id ?? up.id;
-            if (up.storage_path) {
-              const { data: obj } = await supabase.storage.from(RAW_BUCKET).download(up.storage_path);
-              if (obj) {
-                await pushWorkbook(key, await obj.arrayBuffer(), up.original_filename);
-              }
-            }
-          }
-        }
-      } catch (syncError) {
-        console.warn('[hermes/chat] dataset sync warning:', syncError);
-      }
-    }
-
-    const started = Date.now();
-    const envelope = await hermesChat({
-      workspaceId: context.workspaceId,
-      orgId: context.orgId,
-      userId: context.user.id,
-      message: body.message,
-      history: body.history,
+    const { data: job, error } = await supabase.rpc('enqueue_agent_job', {
+      p_workspace_id: body.workspaceId,
+      p_kind: 'chat_turn',
+      // Only the last dozen turns travel. The worker caps history again on its
+      // own side; this keeps the job row from growing without bound when a
+      // conversation runs long.
+      p_payload: {
+        message: body.message,
+        history: body.history.slice(-12),
+      } as never,
     });
 
-    const admin = adminFor(context);
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 403 });
+    }
 
-    // The prompt is recorded; the reply is measured but not copied wholesale
-    // into the audit row. The transcript lives in the run record, and an audit
-    // log that grows by several KB per chat turn stops being readable -- which
-    // is the only property that makes an audit trail worth having.
-    await admin.rpc('write_audit', {
+    // Through the admin client: `write_audit` is revoked from `authenticated`
+    // precisely so a user can cause an audit entry but never compose one.
+    //
+    // `enqueue_agent_job` already audited the enqueue, but not the prompt --
+    // and a question an accountant asked about a client's numbers belongs in the
+    // trail. The reply is not recorded here because it does not exist yet; the
+    // worker writes it onto the job and `agent.job.succeeded` closes the trail.
+    // An audit row per chat turn that grew by several KB would stop being
+    // readable, which is the only property that makes an audit trail worth
+    // having.
+    await adminFor(context).rpc('write_audit', {
       p_org_id: context.orgId,
       p_workspace_id: context.workspaceId,
-      p_action: 'hermes.chat',
-      p_entity_type: 'workspace',
-      p_entity_id: context.workspaceId,
-      p_metadata: {
-        prompt: body.message,
-        reply_chars: envelope.result?.reply?.length ?? 0,
-        status: envelope.status,
-        warnings: envelope.warnings ?? [],
-        duration_ms: Date.now() - started,
-        // Came off the wire as JSON, so it is Json-shaped by construction;
-        // the envelope's index signature is what TypeScript cannot prove.
-        execution_metadata: (envelope.execution_metadata ?? {}) as Json,
-      },
+      p_action: 'hermes.chat.queued',
+      p_entity_type: 'agent_job',
+      p_entity_id: (job as { id: string }).id,
+      p_metadata: { prompt: body.message },
     });
 
-    return NextResponse.json({
-      reply: envelope.result?.reply ?? '',
-      downloads: envelope.result?.downloads ?? [],
-      status: envelope.status,
-      warnings: envelope.warnings ?? [],
-      executionMetadata: envelope.execution_metadata ?? {},
-    });
+    return NextResponse.json({ job });
   } catch (error) {
-    if (error instanceof HermesError) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
-    }
     return handleRouteError(error);
   }
 }

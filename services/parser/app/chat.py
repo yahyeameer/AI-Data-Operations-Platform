@@ -1004,37 +1004,56 @@ def _execute_tool(name: str, args: dict[str, Any], scope_workspace_id: str | Non
 # endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/chat")
-async def chat(request: FastAPIRequest,
-               authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    # Prove the caller is our Next.js dashboard backend
-    valid_secrets = {s for s in (TOOL_SECRET, os.environ.get("HERMES_API_SECRET", "")) if s}
-    if valid_secrets:
-        allowed_headers = {f"Bearer {s}" for s in valid_secrets}
-        if authorization not in allowed_headers:
-            raise HTTPException(401, "Unauthorized")
+class ChatError(RuntimeError):
+    """
+    A chat turn that cannot proceed, with a message fit for the user.
+
+    Exists so this module raises something the *worker* can catch. The turn used
+    to run inside a FastAPI request and raised HTTPException, which is only
+    meaningful to a web framework -- and the turn no longer runs inside a
+    request. `retryable` distinguishes "the model is rate-limited, try again"
+    from "there is no API key", which will fail identically for ever.
+    """
+
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
-    body = await request.json()
-    message: str = (body.get("message") or "").strip()
-    history: list[dict[str, str]] = body.get("history") or []
-    scope_token: str | None = body.get("scope_token")
-    workspace_id: str | None = body.get("workspace_id")
+async def run_chat_turn(
+    message: str,
+    history: list[dict[str, str]] | None = None,
+    workspace_id: str | None = None,
+    on_progress=None,
+) -> dict[str, Any]:
+    """
+    One conversational turn: message in, reply out, tools called in between.
+
+    Extracted from the HTTP route it used to be, because a multi-round tool loop
+    against a free-tier model has no bounded duration and therefore has no
+    business inside a request. The worker calls this from a queued job, so a slow
+    model delays an answer instead of tripping a platform timeout.
+
+    `on_progress` lets the caller extend the job's lease and tell the user which
+    round it is on. It is optional so this stays callable from a test with no
+    queue behind it.
+    """
+    history = history or []
+    message = (message or "").strip()
+
+    def progress(stage: str, **detail: Any) -> None:
+        if on_progress:
+            on_progress({"stage": stage, **detail})
 
     if not message:
-        raise HTTPException(400, "message is empty")
+        raise ChatError("The message is empty.")
     if not OPENROUTER_API_KEY:
-        return {
-            "status": "error",
-            "result": {},
-            "warnings": ["OPENROUTER_API_KEY is not configured on the agent service"],
-            "execution_metadata": {"dry_run": False},
-        }
+        raise ChatError(
+            "No reasoning model is configured for this deployment, so questions in plain "
+            "English cannot be answered. Set OPENROUTER_API_KEY on the engine host."
+        )
 
-    # Scope token is minted by the dashboard after requireWorkspaceAccess ran;
-    # its presence marks an authenticated turn. We do not parse it here (the
-    # dashboard owns verification); we record it in evidence.
-    evidence_scope = "scope_token present" if scope_token else "no scope token"
+    evidence_scope = f"workspace {workspace_id}" if workspace_id else "no workspace scope"
 
     # Fast, reliable path for "categorise this and give me the file". The weak
     # free model is unreliable at driving the categorise->export tool chain to
@@ -1102,6 +1121,10 @@ async def chat(request: FastAPIRequest,
         models_to_try = [m for m in (MODEL_PRIMARY, MODEL_FALLBACK) if m]
 
         for _round in range(MAX_TOOL_ROUNDS + 1):
+            # Each round is another model call plus whatever tools it asks for,
+            # so this is where the lease has to be extended -- a turn that
+            # thinks for four rounds must not have its job stolen mid-thought.
+            progress("thinking", round=_round + 1, of=MAX_TOOL_ROUNDS + 1)
             resp = None
             for attempt_model in models_to_try:
                 resp = await client.post(url, headers=headers, json={
@@ -1118,9 +1141,22 @@ async def chat(request: FastAPIRequest,
                 break
             assert resp is not None
             if resp.status_code == 401:
-                raise HTTPException(502, "OpenRouter rejected the API key")
+                # A bad key fails the same way for ever; retrying spends the
+                # user's wait for nothing.
+                raise ChatError("The reasoning provider rejected this deployment's API key.")
+            if resp.status_code == 429:
+                raise ChatError(
+                    "The reasoning model is rate-limited right now. This will be retried.",
+                    retryable=True,
+                )
+            if resp.status_code >= 500:
+                raise ChatError(
+                    f"The reasoning provider is unavailable ({resp.status_code}). "
+                    f"This will be retried.",
+                    retryable=True,
+                )
             if resp.status_code != 200:
-                raise HTTPException(502, f"OpenRouter error {resp.status_code}: {resp.text[:200]}")
+                raise ChatError(f"The reasoning provider returned an error ({resp.status_code}).")
 
             choice = resp.json()["choices"][0]["message"]
             calls = choice.get("tool_calls") or []
@@ -1206,6 +1242,43 @@ async def chat(request: FastAPIRequest,
             "dry_run": False,
         },
     }
+
+
+@app.post("/api/v1/chat")
+async def chat(request: FastAPIRequest,
+               authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """
+    The HTTP entry point, kept only while the dashboard is migrated onto the
+    queue.
+
+    Calling a chat turn over HTTP is what produced "the analysis is taking longer
+    than this plan allows": the reply had to arrive inside the caller's request,
+    and a multi-round tool loop cannot promise that. `enqueue_agent_job` with
+    kind 'chat_turn' is the supported path; this wrapper exists so the old
+    dashboard keeps working during the changeover and is deleted with the rest of
+    the synchronous surface.
+    """
+    valid_secrets = {s for s in (TOOL_SECRET, os.environ.get("HERMES_API_SECRET", "")) if s}
+    if valid_secrets:
+        allowed_headers = {f"Bearer {s}" for s in valid_secrets}
+        if authorization not in allowed_headers:
+            raise HTTPException(401, "Unauthorized")
+
+    body = await request.json()
+
+    try:
+        return await run_chat_turn(
+            message=body.get("message") or "",
+            history=body.get("history") or [],
+            workspace_id=body.get("workspace_id"),
+        )
+    except ChatError as error:
+        return {
+            "status": "error",
+            "result": {},
+            "warnings": [str(error)],
+            "execution_metadata": {"dry_run": False},
+        }
 
 
 @app.get("/health")

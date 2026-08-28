@@ -16,7 +16,8 @@
     "test:tool-layer": "tsx scripts/tool-layer-smoke.ts",
     "test:queue": "tsx scripts/queue-smoke.ts",
     "test:queue:e2e": "tsx scripts/queue-e2e.ts",
-    "test:cold-start": "tsx scripts/cold-start-check.ts"
+    "test:cold-start": "tsx scripts/cold-start-check.ts",
+    "test:realtime": "tsx scripts/realtime-smoke.ts"
   },
   "devDependencies": {
     "@supabase/supabase-js": "^2.112.3",
