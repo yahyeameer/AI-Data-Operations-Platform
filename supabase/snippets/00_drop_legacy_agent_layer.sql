@@ -21,10 +21,14 @@
 -- has a foreign key into it -- dataset_versions.produced_by_run_id is a bare
 -- uuid with no constraint.
 --
--- Run this ONCE, before applying migrations 005-009.
+-- Run this before applying migrations 005-011. Every statement is `if exists`,
+-- so re-running it is harmless if something fails partway.
+--
+-- No explicit begin/commit: this is delivered through the Management API, which
+-- runs it inside a transaction of its own, and a nested `begin` there is at
+-- best a warning and at worst commits the wrapper early. Idempotency is what
+-- makes that safe to give up.
 -- =============================================================================
-
-begin;
 
 drop function if exists enqueue_agent_job(uuid, agent_job_kind, uuid, uuid, jsonb);
 drop function if exists claim_agent_job(text, integer);
@@ -39,5 +43,3 @@ drop table if exists agent_workers;
 
 drop type if exists agent_job_kind;
 drop type if exists agent_job_status;
-
-commit;

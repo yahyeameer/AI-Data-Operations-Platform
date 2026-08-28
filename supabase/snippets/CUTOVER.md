@@ -48,8 +48,11 @@ Prompts for the database password (Supabase dashboard → Settings → Database)
 ### 2. Drop the legacy agent layer
 
 ```
-npx supabase db execute --file supabase/snippets/00_drop_legacy_agent_layer.sql
+npx supabase db query --linked --file supabase/snippets/00_drop_legacy_agent_layer.sql
 ```
+
+`--linked` matters: without a target flag the CLI runs against the *local*
+stack, which is not the database being cut over.
 
 This removes the phase-1 queue: 7 RPCs, `agent_jobs` (0 rows), `agent_workers`
 (1 disposable heartbeat row), and the two conflicting enum types. It touches no
