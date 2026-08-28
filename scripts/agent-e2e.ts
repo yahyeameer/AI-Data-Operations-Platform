@@ -388,7 +388,7 @@ async function main() {
 
     const { data: after } = await admin
       .from('dataset_versions')
-      .select('version_no, row_count, parent_version_id')
+      .select('id, version_no, row_count, parent_version_id')
       .eq('dataset_id', alpha.datasetId)
       .order('version_no', { ascending: true });
 
@@ -410,6 +410,63 @@ async function main() {
         (version) => version.version_no === parsed!.version_no && version.row_count === 9,
       ),
     );
+
+    // The last mile: a cleaned version handed back as a file someone can open.
+    await postJson(
+      '/api/agent/jobs',
+      {
+        workspaceId: alpha.workspaceId,
+        kind: 'export_dataset',
+        datasetVersionId: cleaned!.id,
+        payload: { format: 'xlsx' },
+      },
+      alpha.cookie,
+    );
+    await waitForQuiet(alpha.workspaceId, alpha.cookie);
+
+    const { data: exportRuns } = await admin
+      .from('agent_jobs')
+      .select('id, status, result, error')
+      .eq('workspace_id', alpha.workspaceId)
+      .eq('kind', 'export_dataset')
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    const exportJob = exportRuns?.[0];
+    const exportResult = (exportJob?.result ?? {}) as Record<string, unknown>;
+
+    check('the export job succeeded', exportJob?.status === 'succeeded', exportJob?.error ?? 'no run');
+    check(
+      'the export wrote a file to the exports bucket',
+      exportResult.bucket === 'exports' && typeof exportResult.export_path === 'string',
+      JSON.stringify(exportResult).slice(0, 200),
+    );
+    // The cleaned version, not the raw one -- exporting the pre-review data
+    // would be the kind of failure nobody notices until a client does.
+    check(
+      'the export carries the cleaned row count',
+      exportResult.row_count === 8,
+      `row_count=${exportResult.row_count}`,
+    );
+
+    if (exportJob) {
+      const link = await get(`/api/exports?jobId=${exportJob.id}`, alpha.cookie);
+      const linkBody = await link.json();
+      check(
+        'Alpha can mint a download link for its own export',
+        link.ok && typeof linkBody.url === 'string',
+        JSON.stringify(linkBody).slice(0, 200),
+      );
+
+      // The property the whole route design exists for: the signing client
+      // bypasses RLS, so this must be refused by the route, not by storage.
+      const crossDownload = await get(`/api/exports?jobId=${exportJob.id}`, beta.cookie);
+      check(
+        "Beta cannot download Alpha's export",
+        crossDownload.status === 404,
+        `got ${crossDownload.status}`,
+      );
+    }
 
     const { data: audit } = await admin
       .from('audit_logs')
