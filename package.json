@@ -13,7 +13,10 @@
     "test:isolation": "tsx scripts/rls-smoke.ts",
     "test:e2e": "tsx scripts/e2e-upload.ts",
     "fixtures": "python scripts/make_messy_fixture.py",
-    "test:tool-layer": "tsx scripts/tool-layer-smoke.ts"
+    "test:tool-layer": "tsx scripts/tool-layer-smoke.ts",
+    "test:queue": "tsx scripts/queue-smoke.ts",
+    "test:queue:e2e": "tsx scripts/queue-e2e.ts",
+    "test:cold-start": "tsx scripts/cold-start-check.ts"
   },
   "devDependencies": {
     "@supabase/supabase-js": "^2.112.3",

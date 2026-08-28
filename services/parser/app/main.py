@@ -170,11 +170,22 @@ def parse_sheet(xlsx_bytes: bytes) -> dict[str, Any]:
     data_rows = raw_rows[header_idx + 1:]
 
     records, dropped = [], []
+    # The spellings a name column held *before* normalisation, per kept row.
+    #
+    # normalize_vendor collapses "Northwind Supplies Ltd" and "northwind
+    # supplies" to one value, which is the right thing for a total and the wrong
+    # thing to do silently: it edits the client's data and tells nobody. Keeping
+    # the originals lets the analysis report the merge as a finding, so the
+    # accountant sees that two spellings were treated as one party and can say
+    # whether that is correct. Held beside the records rather than in them, so
+    # the dataframe schema every other caller reads is unchanged.
+    originals: dict[str, list[Any]] = {}
     for r in data_rows:
         if is_junk_row(r):
             dropped.append(r)
             continue
         rec = {}
+        raw_names: dict[str, Any] = {}
         for j, col in enumerate(columns):
             v = r[j] if j < len(r) else None
             lc = col.lower()
@@ -184,12 +195,15 @@ def parse_sheet(xlsx_bytes: bytes) -> dict[str, Any]:
                 rec[col] = money(v)
             elif any(k in lc for k in ("supplier", "vendor", "name", "customer")):
                 rec[col] = normalize_vendor(v) if v else None
+                raw_names[col] = str(v).strip() if v is not None else None
             else:
                 rec[col] = str(v).strip() if v is not None else None
         # keep only rows with at least one meaningful value beyond an invoice ref
         vals = [x for x in rec.values() if x is not None]
         if len(vals) >= 2:
             records.append(rec)
+            for col, value in raw_names.items():
+                originals.setdefault(col, []).append(value)
 
     if not records:
         df = pl.DataFrame({c: [] for c in columns})
@@ -212,6 +226,13 @@ def parse_sheet(xlsx_bytes: bytes) -> dict[str, Any]:
         "header_row": header_idx,
         "columns": columns,
         "dropped_rows": len(dropped),
+        # The rows themselves, not just how many. A file's own TOTAL row is
+        # junk as far as the dataset is concerned, but it is also the file
+        # declaring what it believes it adds up to -- and checking our sum
+        # against that declaration is the single most valuable thing the
+        # analysis does. Discarding the values made that check impossible.
+        "dropped": dropped,
+        "original_names": originals,
         "notes": _extract_notes(wb),
     }
 

@@ -62,7 +62,7 @@ export async function uploadStatement({
   datasetName: string | null;
   instructions?: string | null;
   onPhase?: (phase: UploadPhase) => void;
-}): Promise<{ uploadId: string; datasetId: string | null }> {
+}): Promise<{ uploadId: string; datasetId: string | null; jobId: string | null }> {
   const phase = (next: UploadPhase) => onPhase?.(next);
 
   phase('hashing');
@@ -110,5 +110,13 @@ export async function uploadStatement({
   const completed = await completeResponse.json();
   if (!completeResponse.ok) throw new Error(completed.error ?? 'Could not record the upload');
 
-  return { uploadId: signed.uploadId as string, datasetId: (signed.datasetId as string) ?? null };
+  // The analysis is now a queued job rather than something this request waited
+  // for, so what comes back is an id to watch instead of a result. Null means
+  // the file stored but the job could not be queued -- the upload still
+  // succeeded, and the caller can offer to try the analysis again.
+  return {
+    uploadId: signed.uploadId as string,
+    datasetId: (signed.datasetId as string) ?? null,
+    jobId: (completed.jobId as string) ?? null,
+  };
 }

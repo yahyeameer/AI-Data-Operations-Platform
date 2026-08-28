@@ -1,0 +1,32 @@
+# The analysis worker.
+#
+# Same code as the parser image, different shape: no port, no HEALTHCHECK, no
+# server. The process dials out to Supabase, claims jobs from `agent_jobs` and
+# writes results back, so there is nothing to bind and nothing to probe -- a
+# container healthcheck curling /health would fail forever here, which is why
+# this is a separate file rather than the same image with an overridden command.
+#
+# Liveness is reported to the database instead: the worker upserts a heartbeat
+# into `agent_workers` every 30 seconds, and the dashboard treats three missed
+# beats as offline. That is the only liveness signal that survives the worker
+# living on a host the dashboard cannot reach.
+FROM python:3.13-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+# Unbuffered so a crash loop is diagnosable from the platform's log tail rather
+# than stuck in a pipe buffer.
+ENV PYTHONUNBUFFERED=1
+
+# SIGTERM reaches the process directly in exec form, which is what lets the
+# worker finish its current job before exiting instead of being killed mid-run.
+CMD ["python", "-m", "app.worker"]
