@@ -7,16 +7,6 @@ import type { Database } from '@/lib/database.types';
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const PUBLISHABLE_KEY = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!;
 
-// Bound Supabase network calls so a hung auth refresh (a drifted/"already used"
-// session cookie) fails fast instead of stalling a server render. The proxy is
-// the primary guard, but pages re-establish the user themselves, so give that
-// path the same ceiling.
-const SERVER_FETCH_TIMEOUT_MS = 5000;
-
-function timeoutFetch(input: RequestInfo | URL, init?: RequestInit) {
-  return fetch(input, { ...init, signal: AbortSignal.timeout(SERVER_FETCH_TIMEOUT_MS) });
-}
-
 /**
  * Server client for Server Components, Server Actions and Route Handlers.
  *
@@ -28,7 +18,6 @@ export async function createServerSupabase() {
   const cookieStore = await cookies();
 
   return createServerClient<Database>(SUPABASE_URL, PUBLISHABLE_KEY, {
-    global: { fetch: timeoutFetch },
     cookies: {
       getAll() {
         return cookieStore.getAll();
