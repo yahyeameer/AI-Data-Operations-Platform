@@ -16,6 +16,8 @@ import {
   type UploadPhase,
 } from '@/lib/upload-client';
 import { ErrorText, Field, ProgressBar, Spinner, buttonClass, buttonStyle, inputClass, inputFocusHandler, inputStyle } from '@/components/ui';
+import { useAnalysisJob } from '@/lib/analysis-job';
+import { AnalysisResult } from '@/components/analysis-result';
 
 type Dataset = { id: string; name: string };
 
@@ -35,6 +37,11 @@ export function UploadPanel({
   const [agentInstructions, setAgentInstructions] = useState('');
   const [dragActive, setDragActive] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  // The analysis is a queued job now, so what the upload hands back is an id to
+  // watch rather than a result to render.
+  const [jobId, setJobId] = useState<string | null>(null);
+
+  const { job, engineAwake, error: pollError } = useAnalysisJob(jobId);
 
   // Sync datasetId if workspaceId or datasets list changes
   useEffect(() => {
@@ -76,8 +83,10 @@ export function UploadPanel({
       ? (datasetName.trim() || fallbackName)
       : null;
 
+    setJobId(null);
+
     try {
-      const { datasetId: createdDatasetId } = await uploadStatement({
+      const { datasetId: createdDatasetId, jobId: queuedJobId } = await uploadStatement({
         workspaceId,
         file,
         datasetId: creatingNewDataset ? null : datasetId,
@@ -91,6 +100,16 @@ export function UploadPanel({
       setDatasetName('');
       setAgentInstructions('');
       if (createdDatasetId) setDatasetId(createdDatasetId);
+
+      // The file is stored either way. A null id means only that queueing the
+      // analysis failed, which is worth saying plainly rather than leaving the
+      // user watching a panel that will never fill in.
+      if (queuedJobId) {
+        setJobId(queuedJobId);
+      } else {
+        setError('The file was uploaded, but the analysis could not be queued. Try again.');
+      }
+
       router.refresh();
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : 'Upload failed');
@@ -241,6 +260,12 @@ export function UploadPanel({
           'Upload statement'
         )}
       </button>
+
+      {jobId && (
+        <div className="az-animate-in pt-2">
+          <AnalysisResult job={job} engineAwake={engineAwake} pollError={pollError} />
+        </div>
+      )}
     </form>
   );
 }

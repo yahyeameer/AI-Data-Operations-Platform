@@ -5,8 +5,6 @@ import { handleRouteError } from '@/lib/api';
 import { adminFor, requireWorkspaceAccess } from '@/lib/authz';
 import { createServerSupabase } from '@/lib/supabase/server';
 import { RAW_BUCKET } from '@/lib/storage';
-import { sendHermesWebhook } from '@/lib/hermes';
-import { isParserConfigured, notifyParserUpload, pushWorkbook } from '@/lib/parser-client';
 
 /**
  * Step 2 of the upload: confirm the object actually landed, then promote the
@@ -160,50 +158,29 @@ export async function POST(request: Request) {
       },
     });
 
-    // Dispatch to the parser service (primary) and the Hermes agent webhook
-    // (secondary, for agent-side awareness). Parse failures must not fail the
-    // upload itself: the file is safely stored and audited either way.
-    const parserNotes: Record<string, unknown> = { parserConfigured: isParserConfigured() };
+    // Queue the analysis instead of running it.
+    //
+    // This route used to download the workbook into the function and push the
+    // bytes to the parser over HTTP, then wait. That made finishing an upload
+    // depend on the parser being awake -- a cold start on the engine surfaced
+    // here as a failed upload, for a file that was already safely stored.
+    //
+    // Now the work becomes a row. The worker claims it whenever it is up and
+    // writes the result back, and the browser polls /api/analyze/:id. Nothing
+    // on this request waits for the engine, so nothing on it can time out.
+    const { data: job, error: enqueueError } = await db.rpc('enqueue_agent_job', {
+      p_workspace_id: context.workspaceId,
+      p_kind: 'analyze_workbook',
+      p_raw_upload_id: upload.id,
+      p_dataset_id: upload.dataset_id ?? undefined,
+      p_payload: (body.instructions ? { instructions: body.instructions } : {}) as never,
+    });
 
-    if (isParserConfigured() && upload.storage_path) {
-      try {
-        const datasetKey = upload.dataset_id ?? upload.id;
-        // Download from our own storage and push bytes so the parser does not
-        // need Supabase credentials of its own.
-        const { data: obj } = await storageClient.from(RAW_BUCKET).download(upload.storage_path);
-        if (obj) {
-          await pushWorkbook(datasetKey, await obj.arrayBuffer());
-        }
-        const parseResult = (await notifyParserUpload({
-          dataset_id: datasetKey,
-          filename: upload.original_filename,
-          tenant_id: context.orgId,
-          workspace_id: context.workspaceId,
-          storage_path: upload.storage_path,
-          sha256: body.sha256 ?? null,
-        })) as { parse?: Record<string, unknown>; warning?: string };
-        parserNotes.parse = parseResult.parse ?? null;
-        parserNotes.warning = parseResult.warning ?? null;
-      } catch (parserError) {
-        console.warn('[uploads/complete] parser dispatch warning:', parserError);
-        parserNotes.error = parserError instanceof Error ? parserError.message : 'parse dispatch failed';
-      }
-    }
-
-    try {
-      await sendHermesWebhook({
-        event: 'workbook.uploaded',
-        dataset_id: upload.dataset_id ?? upload.id,
-        filename: upload.original_filename,
-        tenant_id: context.orgId,
-        workspace_id: context.workspaceId,
-        upload_id: upload.id,
-        storage_path: upload.storage_path,
-        sha256: body.sha256 ?? null,
-        instructions: body.instructions || null,
-      });
-    } catch (webhookError) {
-      console.warn('Hermes Webhook dispatch warning:', webhookError);
+    if (enqueueError) {
+      // The upload itself succeeded and is audited. Failing to queue the
+      // analysis is worth reporting, but it must not turn a stored file into an
+      // error -- the user can press Analyze again.
+      console.error('[uploads/complete] could not queue analysis:', enqueueError.message);
     }
 
     return NextResponse.json({
@@ -211,7 +188,7 @@ export async function POST(request: Request) {
       status: 'stored',
       byteSize: actualSize,
       datasetVersionId,
-      parser: parserNotes,
+      jobId: (job as { id?: string } | null)?.id ?? null,
     });
   } catch (error) {
     return handleRouteError(error);

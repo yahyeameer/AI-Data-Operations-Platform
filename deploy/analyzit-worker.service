@@ -1,0 +1,72 @@
+# systemd unit for the AnalyzeIt analysis worker (Hostinger VPS).
+#
+# This is the process that replaced the synchronous parser call. It serves
+# nothing and listens on no port: it dials out to Supabase, claims jobs from
+# `agent_jobs`, runs the analysis, and writes the result back. Consequences
+# worth stating, because they are the reason the timeout is gone:
+#
+#   * No inbound port, no domain, no TLS certificate, no firewall rule. There is
+#     no "who else can reach the worker" question to answer.
+#   * A reboot, a redeploy or a crash delays work rather than losing it. The job
+#     stays queued; a lapsed lease simply makes it claimable again.
+#   * Nothing on the user's request path waits for this host, so it can be as
+#     slow to start as it likes. That is what the old design could not survive.
+#
+# Install:
+#   sudo cp deploy/analyzit-worker.service /etc/systemd/system/
+#   # edit User= and the paths below if the repo lives elsewhere
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now analyzit-worker
+#   systemctl status analyzit-worker
+#   journalctl -u analyzit-worker -f      # live logs
+#
+# Prereqs on the VPS (once):
+#   cd services/parser && python3 -m venv venv && venv/bin/pip install -r requirements.txt
+#
+# Required in the EnvironmentFile below:
+#   SUPABASE_URL=https://<project>.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY=sb_secret_...     # or SUPABASE_SECRET_KEY
+#
+# Note there is no HERMES_API_SECRET here and none is needed. That secret
+# existed so the dashboard could prove an inbound call was genuine; the worker
+# takes no inbound calls, so the shared secret it was protecting is gone rather
+# than merely rotated. Its only credential is the Supabase service key.
+#
+# Optional:
+#   WORKER_ID=hostinger-1        # stable name in the agent_workers table
+#   WORKER_LEASE_SECONDS=300     # raise for very large workbooks
+#   WORKER_POLL_SECONDS=5        # how often it asks for work when idle
+#   LOG_LEVEL=INFO
+
+[Unit]
+Description=AnalyzeIt analysis worker (claims jobs from Supabase, no inbound port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=analyzit
+WorkingDirectory=/opt/AI-Data-Operations-Platform/services/parser
+EnvironmentFile=/opt/AI-Data-Operations-Platform/services/parser/.env
+ExecStart=/opt/AI-Data-Operations-Platform/services/parser/venv/bin/python -m app.worker
+Restart=always
+RestartSec=5
+
+# The worker finishes its current job on SIGTERM rather than dropping it, so the
+# stop window has to be longer than the parser unit's. An analysis that is
+# nearly done has already spent the expensive part, and a deploy should not cost
+# the customer their month-end run. Anything still running at 120s is covered by
+# the lease: the job returns to the queue and another claim picks it up.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Basic hardening. The worker reads no local files beyond its own code and the
+# EnvironmentFile, so it can be locked down harder than the web service.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/AI-Data-Operations-Platform/services/parser
+
+[Install]
+WantedBy=multi-user.target
