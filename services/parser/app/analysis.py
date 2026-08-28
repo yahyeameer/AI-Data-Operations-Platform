@@ -192,40 +192,67 @@ def check_entity_variants(df, originals: dict[str, list[Any]]) -> list[dict[str,
         if not multi:
             continue
 
-        # The rows whose spelling was rewritten -- what the merge actually
-        # touched, rather than how many distinct spellings there were.
-        affected_rows = sorted(
-            index for key in multi for index in rows_by_group[key]
-        )
+        # Two different things hide in `multi`, and tiering them together makes
+        # the queue noisier than it needs to be.
+        #
+        # "Fabrikam  Ltd" vs "Fabrikam Ltd" differ only in whitespace. Treating
+        # them as one party is not a judgement, it is typing being tidied, and
+        # asking an accountant to rule on it spends the attention that the next
+        # item actually needs.
+        #
+        # "CONTOSO LIMITED" vs "Contoso Ltd." is a judgement. They are probably
+        # the same company; they might not be. That one is worth a person.
+        substantive: dict[str, set[str]] = {}
+        whitespace: dict[str, set[str]] = {}
+        for key, spellings in multi.items():
+            collapsed = {re.sub(r"\s+", " ", s).strip() for s in spellings}
+            (whitespace if len(collapsed) == 1 else substantive)[key] = spellings
 
-        value_gbp = None
-        if money_cols and affected_rows:
-            series = df[money_cols[0]]
-            value_gbp = float(
-                sum(
-                    series[index] or 0.0
-                    for index in affected_rows
-                    if index < df.height
+        for kind, found in (("substantive", substantive), ("whitespace", whitespace)):
+            if not found:
+                continue
+
+            # The rows whose spelling was rewritten -- what the merge actually
+            # touched, rather than how many distinct spellings there were.
+            affected_rows = sorted(index for key in found for index in rows_by_group[key])
+
+            examples = "; ".join(
+                " / ".join(sorted(spellings)) for spellings in list(found.values())[:3]
+            )
+
+            if kind == "whitespace":
+                findings.append(
+                    _finding(
+                        "routine",
+                        f"whitespace_variants:{column}",
+                        f"Tidied spacing in {column}",
+                        f"Values differing only by stray spaces were read as one: {examples}.",
+                        rows=len(affected_rows),
+                    )
+                )
+                continue
+
+            value_gbp = None
+            if money_cols and affected_rows:
+                series = df[money_cols[0]]
+                value_gbp = float(
+                    sum(series[index] or 0.0 for index in affected_rows if index < df.height)
+                )
+
+            findings.append(
+                _finding(
+                    "review",
+                    f"entity_variants:{column}",
+                    f"Merge {len(found)} spelling group"
+                    + ("s" if len(found) != 1 else "")
+                    + f" in {column}",
+                    f"The same party appears under more than one spelling and these rows were "
+                    f"read as one party: {examples}. Left unmerged, each spelling totals "
+                    f"separately.",
+                    rows=len(affected_rows),
+                    value=value_gbp,
                 )
             )
-
-        examples = "; ".join(
-            " / ".join(sorted(spellings)) for spellings in list(multi.values())[:3]
-        )
-        findings.append(
-            _finding(
-                "review",
-                f"entity_variants:{column}",
-                f"Merge {len(multi)} spelling group"
-                + ("s" if len(multi) != 1 else "")
-                + f" in {column}",
-                f"The same party appears under more than one spelling and these rows were "
-                f"read as one party: {examples}. Left unmerged, each spelling totals "
-                f"separately.",
-                rows=len(affected_rows),
-                value=value_gbp,
-            )
-        )
 
     return findings
 
