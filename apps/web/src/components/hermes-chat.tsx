@@ -10,6 +10,7 @@ import {
   isAcceptedFilename,
 } from '@/lib/storage';
 import { UPLOAD_PHASE_LABEL, uploadStatement, type UploadPhase } from '@/lib/upload-client';
+import { waitForReply } from '@/lib/chat-job';
 import { ErrorText, Spinner, buttonClass, buttonStyle, inputFocusHandler, inputStyle } from '@/components/ui';
 
 type Dataset = { id: string; name: string };
@@ -97,24 +98,12 @@ export function HermesChat({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [turns, upload]);
 
-  // Wake the parser the instant this screen mounts. On Render's free tier the
-  // analysis service sleeps after ~15 min idle; kicking off the cold start now,
-  // while the accountant is still reading the page and typing, means their
-  // first question usually meets a warm parser instead of paying the 30-60s
-  // wake on top of the analysis. Fire-and-forget: the wake is advisory, so its
-  // outcome is deliberately ignored and never blocks or interrupts the UI.
-  useEffect(() => {
-    const controller = new AbortController();
-    void fetch('/api/hermes/wake', {
-      method: 'POST',
-      cache: 'no-store',
-      signal: controller.signal,
-    }).catch(() => {
-      // Waking is best-effort; the keep-warm cron and the defensive send()
-      // handler are the real guarantees. A failed ping is a non-event here.
-    });
-    return () => controller.abort();
-  }, []);
+  // There is no wake-up ping any more, and deliberately so. It existed because
+  // the first question of the day had to survive a 30-60s cold start inside a
+  // 60s function budget, so the screen tried to start the engine while the
+  // accountant was still typing. A queued turn has no such budget: if the engine
+  // is asleep the job waits for it. Pre-warming a host nothing waits on would be
+  // a request that buys nothing.
 
   async function send(text?: string) {
     const message = (text ?? draft).trim();
@@ -138,44 +127,33 @@ export function HermesChat({
     ]);
 
     try {
+      // Queue the turn. This returns as soon as the row is written -- it does
+      // not wait for the model, which is why the old "taking longer than this
+      // plan allows" path no longer exists to be handled. The body is JSON
+      // because nothing here can run long enough for the platform to replace it
+      // with an error page.
       const response = await fetch('/api/hermes/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ workspaceId, message, history }),
       });
 
-      // The body is not guaranteed to be JSON. When the parser cold-starts and
-      // the analysis runs past the serverless function's wall-clock cap, Vercel
-      // kills the function and returns its own plain-text error page ("An error
-      // occurred..."). Calling response.json() on that throws an opaque
-      // "Unexpected token 'A'". Read text first, parse defensively, and turn a
-      // non-JSON body into a message a user can act on.
-      const raw = await response.text();
-      let body: {
-        error?: string;
-        reply?: string;
-        warnings?: string[];
-        downloads?: unknown;
-      } = {};
-      try {
-        body = raw ? JSON.parse(raw) : {};
-      } catch {
-        // Non-JSON body: almost always the platform timing out the function.
-        throw new Error(
-          response.status === 504 || response.status === 502
-            ? 'The analysis is taking longer than this plan allows. The engine may be waking up — try again in a moment.'
-            : 'The agent was interrupted before it could answer. Please try again in a moment.',
-        );
-      }
-      if (!response.ok) throw new Error(body.error ?? 'The agent could not answer');
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? 'The agent could not take that question');
+
+      const jobId = body.job?.id as string | undefined;
+      if (!jobId) throw new Error('The agent could not take that question');
+
+      // Watch the row. The answer arrives when the worker writes it, however
+      // long that takes, so there is no deadline on the client either.
+      const answer = await waitForReply(jobId);
 
       setTurns((current) => [
         ...current.slice(0, -1),
         {
           role: 'assistant',
-          content: body.reply || '(no answer returned)',
-          warnings: body.warnings,
-          downloads: Array.isArray(body.downloads) ? body.downloads : undefined,
+          content: answer.reply || '(no answer returned)',
+          downloads: answer.downloads.length > 0 ? answer.downloads : undefined,
         },
       ]);
     } catch (caught) {

@@ -197,7 +197,59 @@ def handle_analyze_workbook(supabase: Supabase, job: dict[str, Any], heartbeat) 
     return result
 
 
-HANDLERS = {"analyze_workbook": handle_analyze_workbook}
+def handle_chat_turn(supabase: Supabase, job: dict[str, Any], heartbeat) -> dict[str, Any]:
+    """
+    One conversational turn, run here rather than inside a request.
+
+    This is the job kind that most needed moving. A turn is a multi-round loop
+    against a free-tier model, and its duration is not something anyone can
+    promise in advance -- which is exactly what an HTTP handler is forced to do.
+    Queued, a slow model costs the user a longer wait rather than an error.
+
+    The turn's own progress extends the lease as it goes: four rounds of thinking
+    must not let another worker decide this job was abandoned.
+    """
+    import asyncio
+
+    from .chat import ChatError, run_chat_turn
+
+    payload = job.get("payload") or {}
+    message = payload.get("message") or ""
+    history = payload.get("history") or []
+
+    if not message.strip():
+        raise JobError("There was no question to answer.")
+
+    heartbeat({"stage": "thinking"})
+
+    try:
+        outcome = asyncio.run(
+            run_chat_turn(
+                message=message,
+                history=history,
+                # From the claimed job row, never from the payload: the database
+                # decided which tenant this job belongs to when the dashboard
+                # enqueued it, and the worker does not get a second opinion.
+                workspace_id=job["workspace_id"],
+                on_progress=heartbeat,
+            )
+        )
+    except ChatError as error:
+        raise JobError(str(error), retryable=error.retryable) from error
+
+    result = outcome.get("result") or {}
+    return {
+        "reply": result.get("reply") or "",
+        "downloads": result.get("downloads") or [],
+        "tools_used": (outcome.get("evidence") or {}).get("tools_used") or [],
+        "model": (outcome.get("execution_metadata") or {}).get("model"),
+    }
+
+
+HANDLERS = {
+    "analyze_workbook": handle_analyze_workbook,
+    "chat_turn": handle_chat_turn,
+}
 
 
 # -----------------------------------------------------------------------------

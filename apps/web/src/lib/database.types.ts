@@ -1034,7 +1034,7 @@ export type Database = {
       }
     }
     Enums: {
-      agent_job_kind: "analyze_workbook"
+      agent_job_kind: "analyze_workbook" | "chat_turn"
       agent_job_status:
         | "queued"
         | "running"
@@ -1179,7 +1179,7 @@ export const Constants = {
   },
   public: {
     Enums: {
-      agent_job_kind: ["analyze_workbook"],
+      agent_job_kind: ["analyze_workbook", "chat_turn"],
       agent_job_status: [
         "queued",
         "running",
