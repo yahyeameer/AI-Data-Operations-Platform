@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
+import re
 from typing import Any
 
 
@@ -221,4 +222,63 @@ def rows_to_csv(rows: list[dict[str, Any]]) -> bytes:
     return b"\xef\xbb\xbf" + buffer.getvalue().encode("utf-8")
 
 
-__all__ = ["build_markdown_report", "rows_to_csv"]
+# Types openpyxl writes natively. Everything else -- a dict from a nested
+# column, a Decimal, a UUID -- becomes its string form, because a cell that
+# raises on write loses the whole export over one awkward value.
+_XLSX_NATIVE = (str, int, float, bool, dt.datetime, dt.date, dt.time)
+
+
+def _xlsx_cell(value: Any) -> Any:
+    if value is None or isinstance(value, _XLSX_NATIVE):
+        return value
+    return str(value)
+
+
+def rows_to_xlsx(rows: list[dict[str, Any]], sheet_name: str = "Data") -> bytes:
+    """
+    Export helper for the `exports` bucket, for people who open the file rather
+    than parse it.
+
+    csv survives everything and xlsx is what actually gets opened, so both
+    exist. The difference that matters is types: a csv hands Excel a pile of
+    text and lets it guess, which is how an account code of 0041 becomes 41 and
+    how 03/04 becomes a date in March. Writing real cell types means the values
+    arrive as the parser understood them.
+
+    openpyxl is imported here rather than at module scope because the markdown
+    path -- which every report job runs -- has no use for it.
+    """
+    # Imported lazily: see the docstring.
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    workbook = Workbook()
+    sheet = workbook.active
+    # Excel refuses >31 chars and the characters below; a dataset named after a
+    # client file will hit both.
+    sheet.title = re.sub(r"[\[\]:*?/\\]", "-", sheet_name)[:31] or "Data"
+
+    if rows:
+        headers = list(rows[0].keys())
+        sheet.append(headers)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+
+        for row in rows:
+            sheet.append([_xlsx_cell(row.get(header)) for header in headers])
+
+        # The header stays put while someone scrolls a few thousand rows. Cheap,
+        # and its absence is the first thing anyone notices.
+        sheet.freeze_panes = "A2"
+
+        for index, header in enumerate(headers, start=1):
+            width = max(len(str(header)), *(len(str(row.get(header, ""))) for row in rows))
+            sheet.column_dimensions[get_column_letter(index)].width = min(max(width + 2, 10), 60)
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+__all__ = ["build_markdown_report", "rows_to_csv", "rows_to_xlsx"]

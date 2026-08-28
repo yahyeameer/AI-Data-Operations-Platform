@@ -1,6 +1,6 @@
 import { notFound } from 'next/navigation';
 
-import { AgentPanel, AnalyseButton } from '@/components/agent-panel';
+import { AgentPanel, AnalyseButton, ExportButton } from '@/components/agent-panel';
 import { ReviewQueue, type ProposedChange } from '@/components/review-queue';
 import { UploadPanel } from '@/components/upload-panel';
 import { Card, EmptyState, PageHeader, StatusBadge } from '@/components/ui';
@@ -38,7 +38,7 @@ export default async function WorkspacePage({ params }: PageProps<'/app/workspac
         .limit(50),
       supabase
         .from('agent_jobs')
-        .select('id, kind, status, progress, error, attempts, created_at, finished_at')
+        .select('id, kind, status, progress, result, error, attempts, created_at, finished_at')
         .eq('workspace_id', workspace.id)
         .order('created_at', { ascending: false })
         .limit(20),
@@ -128,10 +128,15 @@ export default async function WorkspacePage({ params }: PageProps<'/app/workspac
           </p>
 
           {latestVersion ? (
-            <p className="mt-3 text-xs opacity-60">
-              Latest dataset version: v{latestVersion.version_no}
-              {latestVersion.row_count !== null ? ` · ${latestVersion.row_count} rows` : ''}
-            </p>
+            <>
+              <p className="mt-3 text-xs opacity-60">
+                Latest dataset version: v{latestVersion.version_no}
+                {latestVersion.row_count !== null ? ` · ${latestVersion.row_count} rows` : ''}
+              </p>
+              <div className="mt-2">
+                <ExportButton workspaceId={workspace.id} datasetVersionId={latestVersion.id} />
+              </div>
+            </>
           ) : null}
         </section>
 

@@ -30,6 +30,7 @@ const KINDS = [
   'query_dataset',
   'reconcile_sources',
   'generate_report',
+  'export_dataset',
 ] as const;
 
 const createSchema = z.object({

@@ -69,10 +69,10 @@ npx supabase migration repair --status applied 20260819000001 20260819000002 202
 npx supabase db push
 ```
 
-`db push` then applies 005 through 010 in order. Note that 008 adds
+`db push` then applies 005 through 011 in order. Note that 008 adds
 `replay_recipe` to `agent_job_kind` with `alter type … add value` and
 deliberately does not use the new value in the same transaction, so it is safe
-as a single migration.
+as a single migration. 011 adds `export_dataset` the same way.
 
 Migration 010 is the privilege hardening described at the bottom of this file.
 It is ordinary DDL and needs no special handling, but it is the step that closes
@@ -83,6 +83,11 @@ the anon-executable RPCs, so do not skip it.
 ```
 npx supabase gen types typescript --linked > apps/web/src/lib/database.types.ts
 ```
+
+`export_dataset` was added to the committed `database.types.ts` by hand, because
+migration 011 introduced the enum value before there was a database to generate
+against. Regenerating should leave that file unchanged — if `git diff` shows the
+value disappearing, migration 011 did not apply.
 
 Then start the Hermes worker per `services/hermes/README.md`. It registers
 itself in the new `agent_workers` table on its first heartbeat.

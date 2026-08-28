@@ -18,6 +18,10 @@ type Job = {
   kind: AgentJobKind;
   status: AgentJobStatus;
   progress: Json;
+  // Carries the artefact a finished job produced, if it produced one. The
+  // download link reads only the filename from here -- the signed URL is
+  // minted server-side from the job row, never from anything the client holds.
+  result: Json;
   error: string | null;
   attempts: number;
   created_at: string;
@@ -146,6 +150,8 @@ export function AgentPanel({
 
               <JobStatus job={job} />
 
+              <DownloadButton job={job} />
+
               <RelativeTime timestamp={job.finished_at ?? job.created_at} />
 
               {job.error ? (
@@ -252,6 +258,136 @@ function JobStatus({ job }: { job: Job }) {
   return (
     <span className={`rounded px-2 py-0.5 text-xs ${styles[job.status] ?? ''}`}>
       {job.status}
+    </span>
+  );
+}
+
+/** The kinds that leave a file behind in the exports bucket. */
+const DOWNLOADABLE_KINDS = new Set<AgentJobKind>(['generate_report', 'export_dataset']);
+
+/**
+ * The filename a finished job produced, or null if it produced nothing.
+ *
+ * Only the name is taken from the result. The path is read again server-side
+ * off the same row when the URL is signed, so nothing the browser holds decides
+ * which object gets handed out.
+ */
+function artefactName(job: Job): string | null {
+  if (job.status !== 'succeeded' || !DOWNLOADABLE_KINDS.has(job.kind)) return null;
+
+  const result = (job.result ?? {}) as Record<string, unknown>;
+  const path =
+    typeof result.export_path === 'string'
+      ? result.export_path
+      : typeof result.report_path === 'string'
+        ? result.report_path
+        : null;
+
+  return path?.split('/').pop() ?? null;
+}
+
+function DownloadButton({ job }: { job: Job }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const name = artefactName(job);
+  if (!name) return null;
+
+  async function download() {
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/exports?jobId=${job.id}`, { cache: 'no-store' });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? 'Could not prepare the download');
+
+      // The signed URL carries its own Content-Disposition, so navigating to it
+      // saves the file rather than replacing the page. The link is good for a
+      // minute, which is why it is minted on click rather than on render.
+      window.location.href = body.url as string;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not prepare the download');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={download}
+        disabled={busy}
+        title={name}
+        className="rounded border border-black/15 px-2 py-0.5 text-xs transition-colors hover:bg-black/5 disabled:opacity-50 dark:border-white/20 dark:hover:bg-white/10"
+      >
+        {busy ? 'Preparing…' : 'Download'}
+      </button>
+      {error ? <span className="text-xs text-red-600">{error}</span> : null}
+    </>
+  );
+}
+
+/**
+ * Ask the agent to write the cleaned version out as a file.
+ *
+ * Two formats rather than one, because they fail differently. csv opens
+ * anywhere and loses every type on the way in -- an account code of 0041
+ * arrives as 41. xlsx keeps the types the parser worked out, which is what
+ * anyone reconciling against their own spreadsheet actually needs.
+ */
+export function ExportButton({
+  workspaceId,
+  datasetVersionId,
+}: {
+  workspaceId: string;
+  datasetVersionId: string;
+}) {
+  const router = useRouter();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function requestExport(format: 'xlsx' | 'csv') {
+    setBusy(format);
+    setError(null);
+    try {
+      const response = await fetch('/api/agent/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceId,
+          kind: 'export_dataset',
+          datasetVersionId,
+          payload: { format },
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? 'Could not start the export');
+      // The panel above picks the job up on its next poll and shows the
+      // download link when it finishes.
+      router.refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not start the export');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      <span className="text-xs opacity-60">Export cleaned data:</span>
+      {(['xlsx', 'csv'] as const).map((format) => (
+        <button
+          key={format}
+          type="button"
+          onClick={() => requestExport(format)}
+          disabled={busy !== null}
+          className="rounded-md border border-black/15 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-black/5 disabled:opacity-50 dark:border-white/20 dark:hover:bg-white/10"
+        >
+          {busy === format ? 'Starting…' : format === 'xlsx' ? 'Excel' : 'CSV'}
+        </button>
+      ))}
+      {error ? <span className="text-xs text-red-600">{error}</span> : null}
     </span>
   );
 }

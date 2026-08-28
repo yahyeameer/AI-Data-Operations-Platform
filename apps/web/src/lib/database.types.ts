@@ -1697,6 +1697,7 @@ export type Database = {
         | "reconcile_sources"
         | "generate_report"
         | "replay_recipe"
+        | "export_dataset"
       agent_job_status:
         | "queued"
         | "running"
@@ -1874,6 +1875,7 @@ export const Constants = {
         "reconcile_sources",
         "generate_report",
         "replay_recipe",
+        "export_dataset",
       ],
       agent_job_status: [
         "queued",

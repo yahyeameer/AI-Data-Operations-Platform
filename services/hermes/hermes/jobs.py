@@ -1358,6 +1358,94 @@ def _concat_parquet(first: bytes, second: bytes) -> bytes | None:
         return None
 
 
+# -----------------------------------------------------------------------------
+# export_dataset
+# -----------------------------------------------------------------------------
+
+_EXPORT_CONTENT_TYPES = {
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv": "text/csv",
+}
+
+
+def _rows_from_parquet(parquet_bytes: bytes) -> list[dict[str, Any]]:
+    """
+    A stored version as plain rows, in column order.
+
+    `__source_row` is dropped. It is the provenance link back into the original
+    workbook and it is why an approved change can be traced to a line the
+    accountant can point at -- but it is an internal join key, and a column of
+    integers labelled `__source_row` in a file someone is about to send a client
+    is noise at best and confusing at worst.
+    """
+    import io
+
+    import polars as pl
+
+    frame = pl.read_parquet(io.BytesIO(parquet_bytes))
+    columns = [name for name in frame.columns if name != "__source_row"]
+    return frame.select(columns).to_dicts()
+
+
+def handle_export_dataset(context: JobContext) -> dict[str, Any]:
+    """
+    Write a cleaned version out in a format a person can open.
+
+    Deliberately not a new table. An export is derived from a version that is
+    already immutable, so re-running this job on the same version reproduces the
+    same file -- there is nothing to record that the version and the format do
+    not already say. The path goes onto the job result, which is where
+    generate_report puts its own output and where the download route reads from.
+    """
+    version_id = context.job.get("dataset_version_id")
+    if not version_id:
+        raise JobError("this job has no dataset version attached")
+
+    fmt = str(context.payload.get("format") or "xlsx").strip().lower()
+    if fmt not in _EXPORT_CONTENT_TYPES:
+        raise JobError(f"unknown export format {fmt!r}; expected 'xlsx' or 'csv'")
+
+    version = _load_version(context, version_id)
+    parquet_bytes = _load_parquet(context, version)
+
+    context.heartbeat({"stage": "reading"})
+    rows = _rows_from_parquet(parquet_bytes)
+
+    dataset_rows = context.supabase.select(
+        "datasets", columns="id,name", filters={"id": f"eq.{version['dataset_id']}"}, limit=1
+    )
+    dataset_name = dataset_rows[0]["name"] if dataset_rows else "Dataset"
+
+    context.heartbeat({"stage": "writing"})
+    if fmt == "xlsx":
+        body = report.rows_to_xlsx(rows, sheet_name=dataset_name)
+    else:
+        body = report.rows_to_csv(rows)
+
+    period = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
+    path = (
+        f"{context.job['org_id']}/{context.workspace_id}/{period}/"
+        f"{version['dataset_id']}__v{version['version_no']}__export.{fmt}"
+    )
+    stored = context.supabase.upload(
+        EXPORTS_BUCKET,
+        path,
+        body,
+        content_type=_EXPORT_CONTENT_TYPES[fmt],
+        upsert=True,
+    )
+
+    return {
+        "export_path": stored.path,
+        "bucket": EXPORTS_BUCKET,
+        "format": fmt,
+        "row_count": len(rows),
+        "byte_size": stored.size,
+        "dataset_name": dataset_name,
+        "version_no": version["version_no"],
+    }
+
+
 HANDLERS: dict[str, Callable[[JobContext], dict[str, Any]]] = {
     "parse_workbook": handle_parse_workbook,
     "profile_dataset": handle_profile_dataset,
@@ -1367,6 +1455,7 @@ HANDLERS: dict[str, Callable[[JobContext], dict[str, Any]]] = {
     "query_dataset": handle_query_dataset,
     "reconcile_sources": handle_reconcile_sources,
     "generate_report": handle_generate_report,
+    "export_dataset": handle_export_dataset,
 }
 
 

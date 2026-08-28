@@ -1,0 +1,26 @@
+-- =============================================================================
+-- Handing the cleaned data back.
+--
+-- Everything up to here produces a dataset version: typed, versioned, immutable
+-- and stored as Parquet. Parquet is the right thing to keep -- it holds the
+-- types the parser worked out, it is cheap to re-read for the next month's
+-- profile, and it does not lose a leading zero on a sort code. It is also a
+-- format no accountant can open.
+--
+-- So the last mile is a conversion, and it belongs on the worker rather than in
+-- the web app. The parser already holds polars and openpyxl; the alternative is
+-- teaching a Next.js route to read Parquet, which means a WASM decoder shipped
+-- to the browser or a second copy of the type logic in TypeScript. Neither is
+-- worth it for a file the agent can write once and hand back as a signed URL.
+--
+-- Only an enum value is needed. The export lands in the `exports` bucket that
+-- generate_report already writes to, and its path is recorded on the job's
+-- result rather than in a table of its own -- an export is a derived artefact
+-- of a version that is already immutable, so there is nothing to version about
+-- it. Re-running the job reproduces the same file from the same input.
+--
+-- As in 008: `alter type ... add value` is safe inside a transaction as long as
+-- nothing in the same transaction uses the new value, and nothing here does.
+-- =============================================================================
+
+alter type agent_job_kind add value if not exists 'export_dataset';
