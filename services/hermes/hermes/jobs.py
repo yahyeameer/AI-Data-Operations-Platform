@@ -7,13 +7,17 @@ handlers are where the tools in `hermes/tools/` meet the database, and they are
 deliberately the only place that does both -- a tool never talks to Supabase,
 and a handler never implements a transformation.
 
-The pipeline chains rather than doing everything in one job:
+The pipeline chains rather than doing everything in one job, and after the
+first month it takes a different route entirely:
 
-    parse_workbook -> profile_dataset -> propose_cleaning
-                                             |
-                                    (a person approves)
-                                             |
-                                       apply_cleaning
+    month 1   parse -> profile -> propose -> (a person approves) -> apply
+                                                                      |
+                                                             a recipe is saved
+                                                                      |
+    month 2+  parse -> (signature matches the recipe) -> replay -> deviations only
+
+Which route a file takes is decided by `parse_workbook`, from the source
+signature it computes. That branch is MVP criterion 6.
 
 Each step is separately retryable and separately visible. A profiling failure
 does not discard a four-minute parse, and the dashboard can show which stage a
@@ -36,6 +40,14 @@ from .tools.clean import apply_operations, column_hash, to_parquet
 from .tools.parse import ParsedTable, SheetInterpretation, SkippedRow, parse_workbook
 from .tools.profile import Profile, profile_table
 from .tools.propose import build_proposals, summarise
+from .tools.recipe import (
+    build_vocabulary_entries,
+    capture_steps,
+    check_invariants,
+    default_invariants,
+    invariant_status,
+    replay,
+)
 
 log = logging.getLogger("hermes.jobs")
 
@@ -219,27 +231,44 @@ def _profile_from_parquet(
     columns = {
         name: frame[name].to_list() for name in frame.columns if name != "__source_row"
     }
+    return _profile_from_columns(columns, source_rows, stored_interpretation)
 
+
+def _profile_from_columns(
+    columns: dict[str, list[Any]],
+    source_rows: list[int],
+    stored_interpretation: dict[str, Any] | None = None,
+) -> tuple[Profile, ParsedTable]:
+    """
+    Profile an in-memory table.
+
+    Split out from the Parquet path so that a result that has just been
+    computed can be profiled without a serialise-and-reread round trip. Recipe
+    capture needs exactly that: the invariants for the recipe are derived from
+    the cleaned output, which at that point exists only as columns in memory.
+    """
     # A synthetic interpretation: the structural work happened at parse time and
     # is recorded on the version, but profiling only needs the column list and
-    # the types, both of which the Parquet schema already carries.
+    # the types.
     from .tools.parse import ColumnInterpretation
 
-    dtype_map = {
-        pl.Float64: "number",
-        pl.Float32: "number",
-        pl.Int64: "number",
-        pl.Int32: "number",
-        pl.Boolean: "boolean",
-    }
+    business = [name for name in columns if not name.startswith("__raw_")]
+    row_count = len(source_rows)
+
     column_interpretations = []
-    for index, name in enumerate(column for column in frame.columns if column != "__source_row"):
-        if name.startswith("__raw_"):
-            continue
-        dtype = frame.schema[name]
-        inferred = dtype_map.get(type(dtype), "text")
-        if inferred == "text" and _looks_iso_date(frame[name].to_list()):
+    for index, name in enumerate(business):
+        values = columns[name]
+        non_null = [value for value in values if value is not None]
+        inferred = "text"
+        if non_null and all(isinstance(value, bool) for value in non_null):
+            inferred = "boolean"
+        elif non_null and all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in non_null
+        ):
+            inferred = "number"
+        elif _looks_iso_date(values):
             inferred = "date"
+
         column_interpretations.append(
             ColumnInterpretation(
                 index=index,
@@ -247,7 +276,7 @@ def _profile_from_parquet(
                 name=name,
                 inferred_type=inferred,  # type: ignore[arg-type]
                 type_confidence=1.0,
-                non_null=int(frame[name].is_not_null().sum()),
+                non_null=len(non_null),
                 parse_failures=0,
             )
         )
@@ -271,10 +300,10 @@ def _profile_from_parquet(
         sheet_name=(stored_interpretation or {}).get("sheet_name") or "dataset",
         header_row=(stored_interpretation or {}).get("header_row") or 1,
         first_data_row=2,
-        last_data_row=frame.height + 1,
+        last_data_row=row_count + 1,
         first_column=1,
         last_column=len(column_interpretations),
-        data_rows=frame.height,
+        data_rows=row_count,
         columns=column_interpretations,
         skipped=skipped,
         confidence=(stored_interpretation or {}).get("confidence") or 1.0,
@@ -437,14 +466,26 @@ def handle_parse_workbook(context: JobContext) -> dict[str, Any]:
         {"p_dataset_id": dataset_id, "p_signature": parsed.source_signature},
     )
 
-    # Chain to profiling. Higher priority than a fresh parse so a pipeline in
-    # flight finishes before another one starts, which keeps the dashboard's
-    # per-dataset progress monotonic.
+    # The branch that makes month 2 cheap (MVP criterion 6). If this file's
+    # shape matches a recipe the workspace already has, replay it and surface
+    # only what deviates; otherwise fall through to profiling and proposing
+    # from scratch, which is what month 1 needs.
+    matched = context.supabase.rpc(
+        "match_recipe",
+        {"p_workspace_id": context.workspace_id, "p_source_signature": parsed.source_signature},
+    )
+    recipe = matched[0] if isinstance(matched, list) and matched else None
+
+    next_kind = "replay_recipe" if recipe else "profile_dataset"
+
+    # Higher priority than a fresh parse so a pipeline in flight finishes
+    # before another one starts, which keeps the dashboard's per-dataset
+    # progress monotonic.
     context.supabase.rpc(
         "enqueue_agent_job_internal",
         {
             "p_workspace_id": context.workspace_id,
-            "p_kind": "profile_dataset",
+            "p_kind": next_kind,
             "p_dataset_id": dataset_id,
             "p_dataset_version_id": version["id"],
             "p_requested_by": context.requested_by(),
@@ -461,7 +502,17 @@ def handle_parse_workbook(context: JobContext) -> dict[str, Any]:
         "source_signature": parsed.source_signature,
         "confidence": table.interpretation.confidence,
         "interpretation": parsed.to_dict(),
-        "next": "profile_dataset",
+        "matched_recipe": (
+            {
+                "recipe_id": recipe["recipe_id"],
+                "name": recipe["recipe_name"],
+                "version_no": recipe["version_no"],
+                "previous_runs": recipe["run_count"],
+            }
+            if recipe
+            else None
+        ),
+        "next": next_kind,
     }
 
 
@@ -693,11 +744,346 @@ def handle_apply_cleaning(context: JobContext) -> dict[str, Any]:
         },
     )
 
+    # Capture what was approved as a recipe (MVP criterion 5). This is the
+    # moment month 1 becomes reusable, and it is deliberately automatic: an
+    # accountant who has just spent twenty minutes approving changes should not
+    # then have to remember to press "save as recipe".
+    recipe = _capture_recipe_from(context, version, approved, table, result)
+
     summary = result.summary()
     summary["dataset_version_id"] = new_version["id"]
     summary["version_no"] = new_version["version_no"]
     summary["rows_in"] = table.row_count
+    summary["recipe"] = recipe
     return summary
+
+
+def _capture_recipe_from(
+    context: JobContext,
+    version: dict[str, Any],
+    approved: list[dict[str, Any]],
+    table: ParsedTable,
+    result: Any,
+) -> dict[str, Any] | None:
+    """
+    Write the approved operations down as a recipe.
+
+    The one non-obvious step is what happens to an entity merge. Approving
+    "merge CONTOSO LIMITED into Contoso Ltd." produces an inline mapping, and
+    freezing that into the recipe would mean every new supplier next month
+    needs a new recipe version. Instead the pairs go into a workspace mapping
+    table and the step keeps only a reference to it — so the step reads
+    whatever the table knows at replay time, and section 4's "shared, growable"
+    requirement is satisfied by construction rather than by intent.
+    """
+    dataset_id = version["dataset_id"]
+
+    datasets = context.supabase.select(
+        "datasets", columns="id,name,source_signature", filters={"id": f"eq.{dataset_id}"}, limit=1
+    )
+    if not datasets:
+        return None
+    dataset = datasets[0]
+    signature = dataset.get("source_signature")
+
+    # Move every inline entity mapping into a workspace mapping table.
+    mapping_table_ids: dict[str, str] = {}
+    for item in approved:
+        operation = item.get("operation") or {}
+        if operation.get("op") != "map_values":
+            continue
+        column = operation.get("column")
+        mapping = operation.get("mapping") or {}
+        if not column or not mapping:
+            continue
+
+        table_row = context.supabase.rpc(
+            "ensure_mapping_table",
+            {
+                "p_workspace_id": context.workspace_id,
+                "p_name": f"{column} mappings",
+                "p_kind": "entity",
+                "p_created_by": context.requested_by(),
+            },
+        )
+        table_id = table_row["id"]
+        mapping_table_ids[column] = table_id
+
+        # Both halves of the vocabulary: the merges a person approved, and an
+        # identity entry for every value that survived cleaning. Without the
+        # second half the table holds only corrections, and next month every
+        # supplier that was always spelled correctly would be reported as new.
+        entries = build_vocabulary_entries(result.columns.get(column, []), mapping)
+
+        confirmed = [entry for entry in entries if entry.get("confirmed")]
+        observed = [entry for entry in entries if not entry.get("confirmed")]
+
+        if confirmed:
+            context.supabase.rpc(
+                "upsert_mapping_entries",
+                {
+                    "p_mapping_table_id": table_id,
+                    "p_entries": confirmed,
+                    # A person approved this merge, which is stronger evidence
+                    # than anything the run inferred on its own.
+                    "p_confirmed_by": context.requested_by(),
+                },
+            )
+        if observed:
+            context.supabase.rpc(
+                "upsert_mapping_entries",
+                {"p_mapping_table_id": table_id, "p_entries": observed, "p_confirmed_by": None},
+            )
+
+    steps = capture_steps(approved, mapping_table_ids)
+    if not steps:
+        return None
+
+    # Invariants are derived from the cleaned output, because that is the shape
+    # future months are expected to match.
+    cleaned_profile, _cleaned_table = _profile_from_columns(result.columns, result.source_rows)
+    invariants = default_invariants(cleaned_profile)
+
+    captured = context.supabase.rpc(
+        "capture_recipe",
+        {
+            "p_workspace_id": context.workspace_id,
+            "p_dataset_id": dataset_id,
+            "p_source_signature": signature,
+            "p_name": f"{dataset['name']} cleanup",
+            "p_steps": steps,
+            "p_invariants": invariants,
+            "p_change_note": f"Learned from the review of version {version['version_no']}",
+            "p_learned_from": context.job_id,
+            "p_created_by": context.requested_by(),
+        },
+    )
+
+    return {
+        "recipe_version_id": captured["id"],
+        "version_no": captured["version_no"],
+        "steps": len(steps),
+        "invariants": len(invariants),
+        "mapping_tables": mapping_table_ids,
+    }
+
+
+# -----------------------------------------------------------------------------
+# replay_recipe
+# -----------------------------------------------------------------------------
+
+
+def handle_replay_recipe(context: JobContext) -> dict[str, Any]:
+    """
+    Month 2 (MVP criterion 6).
+
+    Instead of profiling from scratch and asking the accountant to approve the
+    same eight things again, the recipe learned last month runs against this
+    month's file and reports only what it could not handle.
+
+    The order of the last three operations is the part that matters. Apply the
+    steps, then check the invariants, and only then decide whether to write an
+    output version. A run that fails an invariant must produce nothing: a
+    cleaned version sitting in storage is a version something downstream will
+    eventually read, and "we wrote it but marked the run blocked" is the shape
+    of every silent-failure incident this product exists to prevent.
+    """
+    version_id = context.job.get("dataset_version_id")
+    if not version_id:
+        raise JobError("this job has no dataset version attached")
+
+    version = _load_version(context, version_id)
+
+    datasets = context.supabase.select(
+        "datasets",
+        columns="id,name,source_signature",
+        filters={"id": f"eq.{version['dataset_id']}"},
+        limit=1,
+    )
+    signature = datasets[0].get("source_signature") if datasets else None
+
+    matched = context.supabase.rpc(
+        "match_recipe",
+        {"p_workspace_id": context.workspace_id, "p_source_signature": signature},
+    )
+    recipe = matched[0] if isinstance(matched, list) and matched else None
+    if not recipe:
+        raise JobError(
+            "No recipe matches this file's layout. Analyse it from scratch and approve the "
+            "changes; that will save a recipe for next month."
+        )
+
+    context.heartbeat({"stage": "downloading", "recipe": recipe["recipe_name"]})
+    parquet_bytes = _load_parquet(context, version)
+    profile, table = _profile_from_parquet(
+        parquet_bytes, _stored_interpretation(context, version)
+    )
+
+    # Everything the workspace currently knows about this client's vocabulary.
+    # Read now rather than baked into the recipe: that is the whole point of a
+    # growable mapping table, and it is what makes last month's resolutions
+    # apply to this month's file.
+    mappings = _load_mappings(context, recipe["steps"])
+
+    run = context.supabase.rpc(
+        "start_recipe_run",
+        {
+            "p_workspace_id": context.workspace_id,
+            "p_recipe_version_id": recipe["recipe_version_id"],
+            "p_dataset_version_in": version_id,
+            "p_job_id": context.job_id,
+        },
+    )
+
+    try:
+        context.heartbeat({"stage": "replaying", "steps": len(recipe["steps"])})
+        # The recipe already records the columns it was learned against, in its
+        # columns_present invariant. Reusing that beats inferring the
+        # expectation from step parameters, which would report every column
+        # that needed no cleaning as new, every month.
+        expected_columns = next(
+            (
+                invariant.get("columns")
+                for invariant in (recipe.get("invariants") or [])
+                if invariant.get("type") == "columns_present"
+            ),
+            None,
+        )
+        result = replay(
+            table, recipe["steps"], profile, mappings, expected_columns=expected_columns
+        )
+
+        context.heartbeat({"stage": "checking invariants"})
+        outcomes, invariant_deviations = check_invariants(
+            recipe.get("invariants") or [], result.cleaned, profile
+        )
+        result.deviations.extend(invariant_deviations)
+        result.invariants = outcomes
+
+        deviation_rows = [deviation.to_row() for deviation in result.deviations]
+        if deviation_rows:
+            context.supabase.rpc(
+                "record_deviations", {"p_run_id": run["id"], "p_deviations": deviation_rows}
+            )
+
+        # Bump hit counts so a mapping entry can show it is earning its keep.
+        for table_id, keys in result.mapping_hits.items():
+            context.supabase.rpc(
+                "record_mapping_hits", {"p_mapping_table_id": table_id, "p_source_keys": keys}
+            )
+
+        summary = result.summary()
+        status_text = invariant_status(outcomes)
+
+        if result.blocked:
+            status = "blocked"
+            output_version = None
+        elif result.needs_review:
+            status = "needs_review"
+            output_version = None
+        else:
+            context.heartbeat({"stage": "writing", "rows": result.cleaned.row_count})
+            new_parquet = to_parquet(result.cleaned.columns, result.cleaned.source_rows)
+            path = _parquet_path(
+                context.job["org_id"],
+                context.workspace_id,
+                version["dataset_id"],
+                context.job_id,
+            )
+            stored = context.supabase.upload(
+                PARQUET_BUCKET,
+                path,
+                new_parquet,
+                content_type="application/vnd.apache.parquet",
+                upsert=True,
+            )
+            written = context.supabase.rpc(
+                "record_dataset_version",
+                {
+                    "p_dataset_id": version["dataset_id"],
+                    "p_kind": "cleaned",
+                    "p_parquet_path": stored.path,
+                    "p_row_count": result.cleaned.row_count,
+                    "p_column_hash": column_hash(result.cleaned.columns),
+                    "p_parent_version_id": version_id,
+                    "p_produced_by_job": context.job_id,
+                    "p_created_by": context.requested_by(),
+                    "p_metadata": {
+                        "stage": "cleaned",
+                        "replayed_recipe": recipe["recipe_name"],
+                        "recipe_version_no": recipe["version_no"],
+                        "automation_rate": result.automation_rate,
+                    },
+                },
+            )
+            status = "succeeded"
+            output_version = written["id"]
+
+        context.supabase.rpc(
+            "finish_recipe_run",
+            {
+                "p_run_id": run["id"],
+                "p_status": status,
+                "p_dataset_version_out": output_version,
+                "p_rows_processed": result.rows_processed,
+                "p_rows_matched": result.rows_matched,
+                "p_auto_corrections": result.auto_corrections,
+                "p_deviations_count": len(result.deviations),
+                "p_automation_rate": result.automation_rate,
+                "p_invariant_status": status_text,
+                "p_summary": summary,
+            },
+        )
+
+    except Exception as error:
+        # A run row that stays 'running' forever is worse than one marked
+        # failed: the dashboard cannot tell it apart from work in progress.
+        context.supabase.rpc(
+            "finish_recipe_run",
+            {
+                "p_run_id": run["id"],
+                "p_status": "failed",
+                "p_summary": {"error": str(error)[:500]},
+            },
+        )
+        raise
+
+    return {
+        "run_id": run["id"],
+        "recipe": recipe["recipe_name"],
+        "recipe_version_no": recipe["version_no"],
+        "status": status,
+        "dataset_version_out": output_version,
+        "rows_processed": result.rows_processed,
+        "auto_corrections": result.auto_corrections,
+        "deviations": len(result.deviations),
+        "automation_rate": result.automation_rate,
+        "invariants": status_text,
+        "summary": summary,
+    }
+
+
+def _load_mappings(context: JobContext, steps: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Current contents of every mapping table the recipe's steps refer to."""
+    table_ids = {
+        step.get("params", {}).get("mapping_table_id")
+        for step in steps
+        if step.get("params", {}).get("mapping_table_id")
+    }
+
+    mappings: dict[str, dict[str, str]] = {}
+    for table_id in table_ids:
+        entries = context.supabase.select(
+            "mapping_entries",
+            columns="source_key,canonical_value",
+            filters={"mapping_table_id": f"eq.{table_id}"},
+            limit=10000,
+        )
+        mappings[table_id] = {
+            entry["source_key"]: entry["canonical_value"] for entry in entries
+        }
+
+    return mappings
 
 
 # -----------------------------------------------------------------------------
@@ -977,6 +1363,7 @@ HANDLERS: dict[str, Callable[[JobContext], dict[str, Any]]] = {
     "profile_dataset": handle_profile_dataset,
     "propose_cleaning": handle_propose_cleaning,
     "apply_cleaning": handle_apply_cleaning,
+    "replay_recipe": handle_replay_recipe,
     "query_dataset": handle_query_dataset,
     "reconcile_sources": handle_reconcile_sources,
     "generate_report": handle_generate_report,

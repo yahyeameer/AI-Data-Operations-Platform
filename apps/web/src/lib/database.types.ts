@@ -303,6 +303,74 @@ export type Database = {
           },
         ]
       }
+      cleaning_recipes: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          current_version_id: string | null
+          dataset_id: string | null
+          enabled: boolean
+          id: string
+          name: string
+          source_signature: string | null
+          template_origin_id: string | null
+          workspace_id: string
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          current_version_id?: string | null
+          dataset_id?: string | null
+          enabled?: boolean
+          id?: string
+          name: string
+          source_signature?: string | null
+          template_origin_id?: string | null
+          workspace_id: string
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          current_version_id?: string | null
+          dataset_id?: string | null
+          enabled?: boolean
+          id?: string
+          name?: string
+          source_signature?: string | null
+          template_origin_id?: string | null
+          workspace_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "cleaning_recipes_current_version_fk"
+            columns: ["current_version_id"]
+            isOneToOne: false
+            referencedRelation: "recipe_versions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "cleaning_recipes_dataset_id_fkey"
+            columns: ["dataset_id"]
+            isOneToOne: false
+            referencedRelation: "datasets"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "cleaning_recipes_template_origin_id_fkey"
+            columns: ["template_origin_id"]
+            isOneToOne: false
+            referencedRelation: "cleaning_recipes"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "cleaning_recipes_workspace_id_fkey"
+            columns: ["workspace_id"]
+            isOneToOne: false
+            referencedRelation: "workspaces"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       dataset_profiles: {
         Row: {
           column_count: number
@@ -446,6 +514,169 @@ export type Database = {
         Relationships: [
           {
             foreignKeyName: "datasets_workspace_id_fkey"
+            columns: ["workspace_id"]
+            isOneToOne: false
+            referencedRelation: "workspaces"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      deviations: {
+        Row: {
+          affected_rows: number
+          column_name: string | null
+          created_at: string
+          detail: string | null
+          evidence: Json
+          group_key: string
+          id: string
+          materiality_gbp: number | null
+          resolution: Database["public"]["Enums"]["deviation_resolution"]
+          resolution_note: string | null
+          resolved_at: string | null
+          resolved_by: string | null
+          resolved_value: string | null
+          run_id: string
+          severity: Database["public"]["Enums"]["deviation_severity"]
+          source_value: string | null
+          suggested_value: string | null
+          title: string
+          type: Database["public"]["Enums"]["deviation_type"]
+          workspace_id: string
+        }
+        Insert: {
+          affected_rows?: number
+          column_name?: string | null
+          created_at?: string
+          detail?: string | null
+          evidence?: Json
+          group_key: string
+          id?: string
+          materiality_gbp?: number | null
+          resolution?: Database["public"]["Enums"]["deviation_resolution"]
+          resolution_note?: string | null
+          resolved_at?: string | null
+          resolved_by?: string | null
+          resolved_value?: string | null
+          run_id: string
+          severity: Database["public"]["Enums"]["deviation_severity"]
+          source_value?: string | null
+          suggested_value?: string | null
+          title: string
+          type: Database["public"]["Enums"]["deviation_type"]
+          workspace_id: string
+        }
+        Update: {
+          affected_rows?: number
+          column_name?: string | null
+          created_at?: string
+          detail?: string | null
+          evidence?: Json
+          group_key?: string
+          id?: string
+          materiality_gbp?: number | null
+          resolution?: Database["public"]["Enums"]["deviation_resolution"]
+          resolution_note?: string | null
+          resolved_at?: string | null
+          resolved_by?: string | null
+          resolved_value?: string | null
+          run_id?: string
+          severity?: Database["public"]["Enums"]["deviation_severity"]
+          source_value?: string | null
+          suggested_value?: string | null
+          title?: string
+          type?: Database["public"]["Enums"]["deviation_type"]
+          workspace_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "deviations_run_id_fkey"
+            columns: ["run_id"]
+            isOneToOne: false
+            referencedRelation: "recipe_runs"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "deviations_workspace_id_fkey"
+            columns: ["workspace_id"]
+            isOneToOne: false
+            referencedRelation: "workspaces"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      mapping_entries: {
+        Row: {
+          canonical_value: string
+          confirmed_at: string | null
+          confirmed_by: string | null
+          created_at: string
+          hit_count: number
+          id: string
+          mapping_table_id: string
+          source_key: string
+          source_value: string
+        }
+        Insert: {
+          canonical_value: string
+          confirmed_at?: string | null
+          confirmed_by?: string | null
+          created_at?: string
+          hit_count?: number
+          id?: string
+          mapping_table_id: string
+          source_key: string
+          source_value: string
+        }
+        Update: {
+          canonical_value?: string
+          confirmed_at?: string | null
+          confirmed_by?: string | null
+          created_at?: string
+          hit_count?: number
+          id?: string
+          mapping_table_id?: string
+          source_key?: string
+          source_value?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "mapping_entries_mapping_table_id_fkey"
+            columns: ["mapping_table_id"]
+            isOneToOne: false
+            referencedRelation: "mapping_tables"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      mapping_tables: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          id: string
+          kind: string
+          name: string
+          workspace_id: string
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          kind?: string
+          name: string
+          workspace_id: string
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          kind?: string
+          name?: string
+          workspace_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "mapping_tables_workspace_id_fkey"
             columns: ["workspace_id"]
             isOneToOne: false
             referencedRelation: "workspaces"
@@ -654,6 +885,143 @@ export type Database = {
           },
         ]
       }
+      recipe_runs: {
+        Row: {
+          auto_corrections: number
+          automation_rate: number | null
+          dataset_version_in: string
+          dataset_version_out: string | null
+          deviations_count: number
+          finished_at: string | null
+          id: string
+          invariant_status: string | null
+          job_id: string | null
+          recipe_version_id: string
+          rows_matched: number
+          rows_processed: number
+          started_at: string
+          status: Database["public"]["Enums"]["recipe_run_status"]
+          summary: Json
+          workspace_id: string
+        }
+        Insert: {
+          auto_corrections?: number
+          automation_rate?: number | null
+          dataset_version_in: string
+          dataset_version_out?: string | null
+          deviations_count?: number
+          finished_at?: string | null
+          id?: string
+          invariant_status?: string | null
+          job_id?: string | null
+          recipe_version_id: string
+          rows_matched?: number
+          rows_processed?: number
+          started_at?: string
+          status?: Database["public"]["Enums"]["recipe_run_status"]
+          summary?: Json
+          workspace_id: string
+        }
+        Update: {
+          auto_corrections?: number
+          automation_rate?: number | null
+          dataset_version_in?: string
+          dataset_version_out?: string | null
+          deviations_count?: number
+          finished_at?: string | null
+          id?: string
+          invariant_status?: string | null
+          job_id?: string | null
+          recipe_version_id?: string
+          rows_matched?: number
+          rows_processed?: number
+          started_at?: string
+          status?: Database["public"]["Enums"]["recipe_run_status"]
+          summary?: Json
+          workspace_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "recipe_runs_dataset_version_in_fkey"
+            columns: ["dataset_version_in"]
+            isOneToOne: false
+            referencedRelation: "dataset_versions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "recipe_runs_dataset_version_out_fkey"
+            columns: ["dataset_version_out"]
+            isOneToOne: false
+            referencedRelation: "dataset_versions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "recipe_runs_job_id_fkey"
+            columns: ["job_id"]
+            isOneToOne: false
+            referencedRelation: "agent_jobs"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "recipe_runs_recipe_version_id_fkey"
+            columns: ["recipe_version_id"]
+            isOneToOne: false
+            referencedRelation: "recipe_versions"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "recipe_runs_workspace_id_fkey"
+            columns: ["workspace_id"]
+            isOneToOne: false
+            referencedRelation: "workspaces"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      recipe_versions: {
+        Row: {
+          change_note: string | null
+          created_at: string
+          created_by: string | null
+          id: string
+          invariants: Json
+          learned_from: string | null
+          recipe_id: string
+          steps: Json
+          version_no: number
+        }
+        Insert: {
+          change_note?: string | null
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          invariants?: Json
+          learned_from?: string | null
+          recipe_id: string
+          steps?: Json
+          version_no: number
+        }
+        Update: {
+          change_note?: string | null
+          created_at?: string
+          created_by?: string | null
+          id?: string
+          invariants?: Json
+          learned_from?: string | null
+          recipe_id?: string
+          steps?: Json
+          version_no?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "recipe_versions_recipe_id_fkey"
+            columns: ["recipe_id"]
+            isOneToOne: false
+            referencedRelation: "cleaning_recipes"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       workspaces: {
         Row: {
           client_name: string | null
@@ -751,6 +1119,36 @@ export type Database = {
         SetofOptions: {
           from: "*"
           to: "agent_jobs"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
+      capture_recipe: {
+        Args: {
+          p_change_note?: string
+          p_created_by?: string
+          p_dataset_id: string
+          p_invariants?: Json
+          p_learned_from?: string
+          p_name: string
+          p_source_signature: string
+          p_steps: Json
+          p_workspace_id: string
+        }
+        Returns: {
+          change_note: string | null
+          created_at: string
+          created_by: string | null
+          id: string
+          invariants: Json
+          learned_from: string | null
+          recipe_id: string
+          steps: Json
+          version_no: number
+        }
+        SetofOptions: {
+          from: "*"
+          to: "recipe_versions"
           isOneToOne: true
           isSetofReturn: false
         }
@@ -918,6 +1316,28 @@ export type Database = {
           isSetofReturn: false
         }
       }
+      ensure_mapping_table: {
+        Args: {
+          p_created_by?: string
+          p_kind?: string
+          p_name: string
+          p_workspace_id: string
+        }
+        Returns: {
+          created_at: string
+          created_by: string | null
+          id: string
+          kind: string
+          name: string
+          workspace_id: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "mapping_tables"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
       finish_agent_job: {
         Args: {
           p_error?: string
@@ -958,6 +1378,44 @@ export type Database = {
           isSetofReturn: false
         }
       }
+      finish_recipe_run: {
+        Args: {
+          p_auto_corrections?: number
+          p_automation_rate?: number
+          p_dataset_version_out?: string
+          p_deviations_count?: number
+          p_invariant_status?: string
+          p_rows_matched?: number
+          p_rows_processed?: number
+          p_run_id: string
+          p_status: Database["public"]["Enums"]["recipe_run_status"]
+          p_summary?: Json
+        }
+        Returns: {
+          auto_corrections: number
+          automation_rate: number | null
+          dataset_version_in: string
+          dataset_version_out: string | null
+          deviations_count: number
+          finished_at: string | null
+          id: string
+          invariant_status: string | null
+          job_id: string | null
+          recipe_version_id: string
+          rows_matched: number
+          rows_processed: number
+          started_at: string
+          status: Database["public"]["Enums"]["recipe_run_status"]
+          summary: Json
+          workspace_id: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "recipe_runs"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
       has_workspace_access: {
         Args: { p_workspace_id: string }
         Returns: boolean
@@ -975,6 +1433,18 @@ export type Database = {
       mark_changes_applied: {
         Args: { p_dataset_version_id: string; p_group_keys: string[] }
         Returns: number
+      }
+      match_recipe: {
+        Args: { p_source_signature: string; p_workspace_id: string }
+        Returns: {
+          invariants: Json
+          recipe_id: string
+          recipe_name: string
+          recipe_version_id: string
+          run_count: number
+          steps: Json
+          version_no: number
+        }[]
       }
       org_of_workspace: { Args: { p_workspace_id: string }; Returns: string }
       org_role_of: {
@@ -1074,6 +1544,14 @@ export type Database = {
           isSetofReturn: false
         }
       }
+      record_deviations: {
+        Args: { p_deviations: Json; p_run_id: string }
+        Returns: number
+      }
+      record_mapping_hits: {
+        Args: { p_mapping_table_id: string; p_source_keys: string[] }
+        Returns: undefined
+      }
       replace_proposed_changes: {
         Args: {
           p_dataset_version_id: string
@@ -1081,6 +1559,42 @@ export type Database = {
           p_proposals: Json
         }
         Returns: number
+      }
+      resolve_deviation: {
+        Args: {
+          p_deviation_id: string
+          p_note?: string
+          p_resolution: Database["public"]["Enums"]["deviation_resolution"]
+          p_resolved_value?: string
+        }
+        Returns: {
+          affected_rows: number
+          column_name: string | null
+          created_at: string
+          detail: string | null
+          evidence: Json
+          group_key: string
+          id: string
+          materiality_gbp: number | null
+          resolution: Database["public"]["Enums"]["deviation_resolution"]
+          resolution_note: string | null
+          resolved_at: string | null
+          resolved_by: string | null
+          resolved_value: string | null
+          run_id: string
+          severity: Database["public"]["Enums"]["deviation_severity"]
+          source_value: string | null
+          suggested_value: string | null
+          title: string
+          type: Database["public"]["Enums"]["deviation_type"]
+          workspace_id: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "deviations"
+          isOneToOne: true
+          isSetofReturn: false
+        }
       }
       set_dataset_signature: {
         Args: { p_dataset_id: string; p_signature: string }
@@ -1099,7 +1613,67 @@ export type Database = {
           isSetofReturn: false
         }
       }
+      start_recipe_run: {
+        Args: {
+          p_dataset_version_in: string
+          p_job_id?: string
+          p_recipe_version_id: string
+          p_workspace_id: string
+        }
+        Returns: {
+          auto_corrections: number
+          automation_rate: number | null
+          dataset_version_in: string
+          dataset_version_out: string | null
+          deviations_count: number
+          finished_at: string | null
+          id: string
+          invariant_status: string | null
+          job_id: string | null
+          recipe_version_id: string
+          rows_matched: number
+          rows_processed: number
+          started_at: string
+          status: Database["public"]["Enums"]["recipe_run_status"]
+          summary: Json
+          workspace_id: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "recipe_runs"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
       try_uuid: { Args: { p_text: string }; Returns: string }
+      update_recipe_steps: {
+        Args: { p_change_note?: string; p_recipe_id: string; p_steps: Json }
+        Returns: {
+          change_note: string | null
+          created_at: string
+          created_by: string | null
+          id: string
+          invariants: Json
+          learned_from: string | null
+          recipe_id: string
+          steps: Json
+          version_no: number
+        }
+        SetofOptions: {
+          from: "*"
+          to: "recipe_versions"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
+      upsert_mapping_entries: {
+        Args: {
+          p_confirmed_by?: string
+          p_entries: Json
+          p_mapping_table_id: string
+        }
+        Returns: number
+      }
       workspace_of_dataset: { Args: { p_dataset_id: string }; Returns: string }
       write_audit: {
         Args: {
@@ -1122,6 +1696,7 @@ export type Database = {
         | "query_dataset"
         | "reconcile_sources"
         | "generate_report"
+        | "replay_recipe"
       agent_job_status:
         | "queued"
         | "running"
@@ -1130,6 +1705,21 @@ export type Database = {
         | "cancelled"
       change_confidence: "high" | "medium" | "low"
       dataset_version_kind: "raw" | "cleaned"
+      deviation_resolution:
+        | "pending"
+        | "accepted"
+        | "rejected"
+        | "mapped"
+        | "ignored"
+      deviation_severity: "auto" | "review" | "block"
+      deviation_type:
+        | "unmapped_value"
+        | "ambiguous_match"
+        | "new_column"
+        | "missing_column"
+        | "type_drift"
+        | "invariant_failure"
+        | "step_failed"
       org_role: "owner" | "admin" | "member"
       proposed_change_status:
         | "pending"
@@ -1137,6 +1727,12 @@ export type Database = {
         | "rejected"
         | "applied"
         | "superseded"
+      recipe_run_status:
+        | "running"
+        | "succeeded"
+        | "needs_review"
+        | "blocked"
+        | "failed"
       upload_status: "pending" | "stored" | "failed"
       workspace_status: "active" | "archived"
     }
@@ -1277,6 +1873,7 @@ export const Constants = {
         "query_dataset",
         "reconcile_sources",
         "generate_report",
+        "replay_recipe",
       ],
       agent_job_status: [
         "queued",
@@ -1287,6 +1884,23 @@ export const Constants = {
       ],
       change_confidence: ["high", "medium", "low"],
       dataset_version_kind: ["raw", "cleaned"],
+      deviation_resolution: [
+        "pending",
+        "accepted",
+        "rejected",
+        "mapped",
+        "ignored",
+      ],
+      deviation_severity: ["auto", "review", "block"],
+      deviation_type: [
+        "unmapped_value",
+        "ambiguous_match",
+        "new_column",
+        "missing_column",
+        "type_drift",
+        "invariant_failure",
+        "step_failed",
+      ],
       org_role: ["owner", "admin", "member"],
       proposed_change_status: [
         "pending",
@@ -1294,6 +1908,13 @@ export const Constants = {
         "rejected",
         "applied",
         "superseded",
+      ],
+      recipe_run_status: [
+        "running",
+        "succeeded",
+        "needs_review",
+        "blocked",
+        "failed",
       ],
       upload_status: ["pending", "stored", "failed"],
       workspace_status: ["active", "archived"],
